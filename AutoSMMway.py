@@ -45,7 +45,7 @@ if TYPE_CHECKING:
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
 
 NAME = "AutoSMMway"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 DESCRIPTION = ("Универсальная перепродажа SMM-услуг: любые поставщики через профили, мастер-лоты, "
                "автозаказы, мульти-поставщик, автоподнятие, перенос лотов.")
 CREDITS = "@autosmmway"
@@ -55,7 +55,7 @@ SETTINGS_PAGE = True
 LOGGER_PREFIX = "[AutoSMMway]"
 logger = logging.getLogger("FPC.autosmmway")
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 EXPORT_FORMAT_VERSION = 1
 
 DATA_DIR = os.path.join("storage", "plugins", "autosmmway")
@@ -85,7 +85,12 @@ ORDER_CANCELED = "CANCELED"
 ORDER_FAILED = "FAILED"
 ORDER_REFUNDED = "REFUNDED"
 ORDER_CLOSED = "CLOSED"
-ACTIVE_ORDER_STATUSES = (ORDER_NEW, ORDER_WAIT_LINK, ORDER_WAIT_CONFIRM, ORDER_SENDING, ORDER_IN_PROGRESS)
+ORDER_UNCERTAIN = "UNCERTAIN"
+ORDER_REFUND_PENDING = "REFUND_PENDING"
+ACTIVE_ORDER_STATUSES = (ORDER_NEW, ORDER_WAIT_LINK, ORDER_WAIT_CONFIRM, ORDER_SENDING, ORDER_IN_PROGRESS,
+                         ORDER_UNCERTAIN, ORDER_REFUND_PENDING)
+# Статусы, при которых заказ «занимает» ссылку и слот покупателя.
+BUSY_ORDER_STATUSES = (ORDER_WAIT_CONFIRM, ORDER_SENDING, ORDER_IN_PROGRESS, ORDER_UNCERTAIN)
 FINAL_ORDER_STATUSES = (ORDER_COMPLETED, ORDER_PARTIAL, ORDER_CANCELED, ORDER_FAILED, ORDER_REFUNDED,
                         ORDER_CLOSED)
 
@@ -96,7 +101,29 @@ PRICE_MODES = ("per_1000", "pack", "per_1")
 STATUS_EMOJI = {
     ORDER_NEW: "🆕", ORDER_WAIT_LINK: "🔗", ORDER_WAIT_CONFIRM: "❔", ORDER_SENDING: "📤",
     ORDER_IN_PROGRESS: "⏳", ORDER_COMPLETED: "✅", ORDER_PARTIAL: "🌓", ORDER_CANCELED: "🚫",
-    ORDER_FAILED: "❌", ORDER_REFUNDED: "💸", ORDER_CLOSED: "📁",
+    ORDER_FAILED: "❌", ORDER_REFUNDED: "💸", ORDER_CLOSED: "📁", ORDER_UNCERTAIN: "❓", ORDER_REFUND_PENDING: "⌛",
+}
+
+# Причины автовозврата: код -> (текст покупателю, текст админу)
+REFUND_REASONS = {
+    "no_balance": ("временно нет возможности выполнить услугу", "недостаточно баланса у всех поставщиков"),
+    "no_api": ("услуга временно недоступна", "поставщик не подключён (нет ключа/выключен)"),
+    "api_down": ("сервис поставщика временно недоступен", "API поставщиков недоступно"),
+    "auth": ("услуга временно недоступна", "ошибка авторизации API (проверьте ключ)"),
+    "service": ("услуга временно недоступна у поставщика", "услуга отключена/недоступна у всех поставщиков"),
+    "no_supplier": ("услуга временно недоступна", "нет подходящих кандидатов (лимиты min/max, рейтинг)"),
+    "all_failed": ("не удалось запустить заказ", "все поставщики отказали"),
+    "link": ("ссылка не принимается сервисом (профиль закрыт или неверный)", "поставщик отклонил ссылку"),
+    "fx": ("техническая ошибка расчёта", "нет курса валюты"),
+    "link_timeout": ("ссылка не была получена вовремя", "покупатель не прислал ссылку"),
+    "link_attempts": ("не удалось получить корректную ссылку", "превышено число попыток ввода ссылки"),
+    "partial": ("заказ выполнен не полностью", "частичное выполнение, дозаказ остатка не удался"),
+    "timeout": ("заказ не выполнен в срок", "превышено максимальное время выполнения"),
+    "qty": ("выбранное количество недоступно для этой услуги", "количество вне min/max всех кандидатов"),
+    "blacklist": ("заказ не может быть выполнен", "покупатель в чёрном списке"),
+    "limit": ("превышен лимит заказов", "лимит заказов покупателя в час"),
+    "manual": ("заказ отменён продавцом", "возврат вручную"),
+    "uncertain": ("не удалось подтвердить запуск заказа", "неясный результат отправки, таймаут решения"),
 }
 
 DEFAULTS: dict[str, Any] = {
@@ -151,6 +178,32 @@ DEFAULTS: dict[str, Any] = {
     "backup_keep": 5,
     "circuit_errors": 3,
     "circuit_pause": 600,
+    # Автопилот: чем больше включено, тем меньше ручной работы.
+    "auto": {
+        "refund_on_fail": True,          # автовозврат, если заказ не удалось отправить ни одному поставщику
+        "transient_retry_min": 30,       # сколько минут повторять при сетевых сбоях перед возвратом
+        "link_timeout_hours": 24,        # возврат, если покупатель не прислал ссылку (0 — выкл)
+        "link_attempts_refund": False,   # возврат после исчерпания попыток ввода ссылки
+        "confirm_auto_start": True,      # запуск без «+» после напоминания, если ссылка валидна
+        "partial_policy": "reorder_then_refund",
+        "refund_retry_min": 10,          # повтор неудавшегося возврата через N минут
+        "refund_retry_max": 6,
+        "uncertain_refund_hours": 0,     # автовозврат «неясных» заказов через N ч (0 — только админ)
+        "pause_lots_low_balance": True,  # выключать лоты, когда баланса поставщиков не хватает
+        "pause_lots_missing_service": True,
+        "auto_alternatives": True,       # автоподбор запасных поставщиков для лотов
+        "alt_min_score": 0.72,
+        "refill_requests": True,         # покупатель пишет «докрутка» — плагин сам отправляет refill
+        "refill_regex": r"(докрут|отписал|списал|упал|пропал|уменьшил|refill|drop)",
+        "refill_cooldown_hours": 24,
+        "refill_window_days": 30,
+        "confirm_reminder_hours": 24,    # напомнить подтвердить заказ (0 — выкл)
+        "daily_backup": True,
+        "max_orders_per_buyer_hour": 10,
+        "notify_new_orders": False,
+    },
+    "masterlot": {"margin_presets": [15, 20, 25, 30, 40, 50], "title_limit": 100, "desc_limit": 3000,
+                  "min_price": 1.0, "skip_unprofitable": True},
     "messages": {
         "accepted": [
             "Здравствуйте, {buyer}! Заказ #{order_id} принят: {service_name}, {quantity} шт.",
@@ -211,6 +264,27 @@ DEFAULTS: dict[str, Any] = {
             "Спасибо, что вы с нами! Ваш промокод {status}: +{progress} к количеству следующего заказа. "
             "Пришлите его в чат после оплаты.",
         ],
+        "auto_refund": [
+            "Заказ #{order_id}: {status}. Средства автоматически возвращены на ваш баланс FunPay. Приносим извинения!",
+            "К сожалению, заказ #{order_id} не может быть выполнен ({status}). Деньги уже возвращены.",
+        ],
+        "link_reminder": [
+            "Напоминаю: для запуска заказа #{order_id} пришлите ссылку (https://...). Без ссылки заказ будет "
+            "отменён с возвратом средств.",
+        ],
+        "auto_started": [
+            "Подтверждения не было, запускаю заказ #{order_id} по ссылке {link} ✅",
+        ],
+        "refill_ok": [
+            "Запрос на докрутку по заказу #{order_id} отправлен ✅ Обычно восстановление занимает до 24-72 ч.",
+        ],
+        "refill_denied": [
+            "По заказу #{order_id} докрутка недоступна: {status}.",
+        ],
+        "confirm_please": [
+            "Заказ #{order_id} выполнен. Если всё в порядке — подтвердите, пожалуйста, получение на FunPay и "
+            "оставьте отзыв 🙏",
+        ],
         "promo_applied": [
             "Промокод применён: к заказу #{order_id} добавлено {progress}.",
         ],
@@ -223,6 +297,8 @@ MESSAGE_TITLES = {
     "queued_limit": "Лимит заказов", "in_progress": "В работе", "delayed": "Задерживается",
     "status": "Ответ на «статус»", "completed": "Завершён", "partial": "Частично выполнен",
     "canceled": "Отмена/возврат", "promo": "Выдача промокода", "promo_applied": "Промокод применён",
+    "auto_refund": "Автовозврат", "link_reminder": "Напоминание о ссылке", "auto_started": "Автозапуск без «+»",
+    "refill_ok": "Докрутка отправлена", "refill_denied": "Докрутка недоступна", "confirm_please": "Просьба подтвердить",
 }
 
 LOT_CODE_WORDS_HELP = {
@@ -439,6 +515,31 @@ SETTINGS_SCHEMA: list[tuple[str, str, str, str]] = [
     ("loyalty.level1", "Бонус после 1-го заказа, %", "int", "loyalty"),
     ("loyalty.level3", "Бонус после 3-го заказа, %", "int", "loyalty"),
     ("loyalty.level5", "Бонус после 5+ заказов, %", "int", "loyalty"),
+    ("auto.refund_on_fail", "Автовозврат при ошибке отправки", "bool", "auto"),
+    ("auto.transient_retry_min", "Повторять при сбоях сети, мин", "int", "auto"),
+    ("auto.link_timeout_hours", "Возврат без ссылки через, ч (0 — выкл)", "int", "auto"),
+    ("auto.link_attempts_refund", "Возврат после попыток ввода ссылки", "bool", "auto"),
+    ("auto.confirm_auto_start", "Запуск без «+» после напоминания", "bool", "auto"),
+    ("auto.partial_policy", "Частичное выполнение",
+     "choice:reorder_then_refund|reorder_then_admin|refund|admin", "auto"),
+    ("auto.refund_retry_min", "Повтор неудачного возврата, мин", "int", "auto"),
+    ("auto.refund_retry_max", "Попыток возврата", "int", "auto"),
+    ("auto.uncertain_refund_hours", "Возврат «неясных» через, ч (0 — выкл)", "int", "auto"),
+    ("auto.pause_lots_low_balance", "Пауза лотов при нехватке баланса", "bool", "auto"),
+    ("auto.pause_lots_missing_service", "Пауза лотов без доступных услуг", "bool", "auto"),
+    ("auto.auto_alternatives", "Автоподбор запасных поставщиков", "bool", "auto"),
+    ("auto.alt_min_score", "Мин. схожесть для запасного (0-1)", "float", "auto"),
+    ("auto.refill_requests", "Автодокрутка по запросу покупателя", "bool", "auto"),
+    ("auto.refill_regex", "Regex запроса докрутки", "regex", "auto"),
+    ("auto.refill_cooldown_hours", "Пауза между докрутками, ч", "int", "auto"),
+    ("auto.refill_window_days", "Окно докрутки, дней", "int", "auto"),
+    ("auto.confirm_reminder_hours", "Напомнить подтвердить через, ч", "int", "auto"),
+    ("auto.max_orders_per_buyer_hour", "Заказов на покупателя в час", "int", "auto"),
+    ("auto.daily_backup", "Ежедневный автобэкап", "bool", "auto"),
+    ("auto.notify_new_orders", "Уведомлять о каждом заказе", "bool", "auto"),
+    ("masterlot.title_limit", "Лимит длины заголовка", "int", "lots"),
+    ("masterlot.min_price", "Мин. цена лота, ₽", "money", "lots"),
+    ("masterlot.skip_unprofitable", "Пропускать убыточные лоты", "bool", "lots"),
     ("dry_run", "Dry-run (ничего не отправлять)", "bool", "system"),
     ("admin_ids", "ID админов (через запятую)", "ids", "system"),
     ("backup_keep", "Хранить бэкапов", "int", "system"),
@@ -449,7 +550,7 @@ SETTINGS_SCHEMA: list[tuple[str, str, str, str]] = [
 SETTINGS_GROUPS = {
     "fees": "💳 Комиссии", "margin": "📈 Маржа и выбор", "fx": "💱 Курс валют", "intervals": "⏱ Интервалы",
     "lots": "🏷 Лоты", "abuse": "🛡 Антиабьюз", "night": "🌙 Ночной режим", "alerts": "🔔 Алерты",
-    "loyalty": "🎁 Лояльность", "system": "🧰 Система",
+    "loyalty": "🎁 Лояльность", "auto": "🤖 Автопилот", "system": "🧰 Система",
 }
 
 
@@ -685,7 +786,23 @@ def migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
     """)
 
 
-MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {0: migrate_v0_to_v1, 1: migrate_v1_to_v2}
+def migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
+    """Автопилот: блокировка отправки, повторы возвратов, докрутки, автопауза лотов."""
+    for col, decl in (("send_started_at", "INTEGER"), ("refund_attempts", "INTEGER DEFAULT 0"),
+                      ("refund_reason", "TEXT"), ("last_refill_at", "INTEGER"),
+                      ("confirm_reminded", "INTEGER DEFAULT 0"), ("link_reminded", "INTEGER DEFAULT 0"),
+                      ("first_error_at", "INTEGER")):
+        _add_column(conn, "orders", col, decl)
+    for col, decl in (("auto_paused", "TEXT"), ("auto_margin", "TEXT")):
+        _add_column(conn, "lots", col, decl)
+    _exec_script(conn, """
+    CREATE INDEX IF NOT EXISTS ix_orders_buyer ON orders(buyer, created_at);
+    CREATE INDEX IF NOT EXISTS ix_orders_link ON orders(link, status)
+    """)
+
+
+MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {0: migrate_v0_to_v1, 1: migrate_v1_to_v2,
+                                                                2: migrate_v2_to_v3}
 
 
 class Database:
@@ -882,6 +999,9 @@ class Database:
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
 # D. HTTP-СЛОЙ И SUPPLIERS: SupplierBase, GenericSupplier, профили, пресеты
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+API_ERROR_CODES = ("api_error", "no_balance", "auth", "service", "link", "quantity")
+
 
 class SupplierError(Exception):
     """Ошибка поставщика: code — машинный код, message — описание."""
@@ -1163,8 +1283,39 @@ class GenericSupplier(SupplierBase):
             body = {}
         return method, url, body, headers, query
 
+    @staticmethod
+    def classify_api_error(message: str) -> str:
+        """Код ошибки API по тексту: no_balance, auth, service, link, quantity, api_error."""
+        m = message.lower()
+        if any(x in m for x in ("balance", "funds", "баланс", "средств", "insufficient", "not enough")):
+            return "no_balance"
+        if any(x in m for x in ("api key", "invalid key", "incorrect key", "ключ", "unauthor", "auth", "token",
+                                "forbidden", "access denied")):
+            return "auth"
+        if any(x in m for x in ("service", "услуг", "disabled", "not available", "unavailable", "inactive")):
+            return "service"
+        if any(x in m for x in ("link", "url", "ссылк", "private", "закрыт", "username")):
+            return "link"
+        if any(x in m for x in ("quantity", "количеств", "min", "max")):
+            return "quantity"
+        return "api_error"
+
+    @staticmethod
+    def _sent_before_failure(exc: Exception) -> bool:
+        """True — запрос мог дойти до сервера (повтор небезопасен для неидемпотентных методов)."""
+        if isinstance(exc, requests.ConnectTimeout):
+            return False
+        text = str(exc)
+        if isinstance(exc, requests.ConnectionError) and any(
+                x in text for x in ("NewConnectionError", "Failed to establish", "Name or service not known",
+                                    "getaddrinfo", "Connection refused", "No route to host", "ProxyError")):
+            return False
+        return True
+
     def _request(self, endpoint: str, params: Optional[dict] = None, use_breaker: bool = True) -> Any:
         params = params or {}
+        # «add» неидемпотентен: повтор после того, как запрос дошёл до сервера, может создать второй заказ.
+        unsafe = endpoint == "add"
         if use_breaker and self.breaker.is_open:
             raise SupplierError("circuit_open", f"поставщик на паузе до "
                                                 f"{datetime.fromtimestamp(self.breaker.open_until):%H:%M}")
@@ -1181,31 +1332,49 @@ class GenericSupplier(SupplierBase):
                     resp = self.session.request(method, url, data=body if method != "GET" else None,
                                                 headers=headers, params=query, timeout=self.timeout)
                 self.last_raw = resp.text[:2000]
-                if resp.status_code in (429,) or resp.status_code >= 500:
+                if resp.status_code == 429:
+                    raise SupplierError("http_429", "HTTP 429 (лимит запросов)", resp.text[:500])
+                if resp.status_code >= 500:
+                    # 502/503 — шлюз не передал запрос приложению, повтор безопасен; 500/504 — результат неизвестен.
+                    if unsafe and resp.status_code not in (502, 503):
+                        raise SupplierError("uncertain", f"HTTP {resp.status_code} на создании заказа — "
+                                                         f"заказ мог быть создан", resp.text[:500])
                     raise SupplierError(f"http_{resp.status_code}", f"HTTP {resp.status_code}", resp.text[:500])
                 try:
                     data = resp.json()
                 except ValueError:
+                    if unsafe and resp.status_code < 400:
+                        raise SupplierError("uncertain", "ответ на создание заказа не JSON — заказ мог быть создан",
+                                            resp.text[:500])
                     raise SupplierError("bad_json", f"ответ не JSON (HTTP {resp.status_code})", resp.text[:500])
                 err_path = self._resp_path("error")
                 err = json_path_get(data, err_path) if err_path and isinstance(data, dict) else None
                 if err:
                     # Ошибки уровня API не ретраим: это ответ сервера, а не сбой сети.
                     self.breaker.ok()
-                    raise SupplierError("api_error", str(err)[:300], data)
+                    if resp.status_code in (401, 403):
+                        raise SupplierError("auth", str(err)[:300], data)
+                    raise SupplierError(self.classify_api_error(str(err)), str(err)[:300], data)
+                if resp.status_code in (401, 403):
+                    raise SupplierError("auth", f"HTTP {resp.status_code}: доступ запрещён (проверьте ключ)",
+                                        resp.text[:500])
                 if resp.status_code >= 400:
                     raise SupplierError(f"http_{resp.status_code}", f"HTTP {resp.status_code}", resp.text[:500])
                 self.breaker.ok()
                 return data
             except SupplierError as e:
-                if e.code == "api_error":
+                if e.code in API_ERROR_CODES or e.code == "uncertain":
                     raise
                 last_error = e
-            except requests.Timeout:
-                last_error = SupplierError("timeout", f"таймаут {self.timeout} c")
             except requests.RequestException as e:
-                last_error = SupplierError("network", str(e).replace(self.api_key, mask_secret(self.api_key))[:200]
-                                           if self.api_key else str(e)[:200])
+                text = str(e).replace(self.api_key, mask_secret(self.api_key)) if self.api_key else str(e)
+                if unsafe and self._sent_before_failure(e):
+                    raise SupplierError("uncertain", f"обрыв связи после отправки заказа ({text[:120]}) — "
+                                                     f"заказ мог быть создан")
+                if isinstance(e, requests.Timeout):
+                    last_error = SupplierError("timeout", f"таймаут {self.timeout} c")
+                else:
+                    last_error = SupplierError("network", text[:200])
             log_warn(f"{self.name}: {endpoint} попытка {attempt + 1}/{self.retries}: {last_error.message}")
             if attempt < self.retries - 1:
                 time.sleep(delays[min(attempt, len(delays) - 1)])
@@ -1532,6 +1701,9 @@ class SupplierManager:
 
     def service(self, sid: int, service_id: str) -> Optional[dict]:
         return self.db.one("SELECT * FROM services WHERE supplier_id=? AND service_id=?", (sid, str(service_id)))
+
+    def invalidate_balance(self, sid: int) -> None:
+        self._balances.pop(sid, None)
 
     def balance(self, sid: int, max_age: int = 300) -> tuple[Optional[Decimal], str]:
         """Баланс поставщика с кэшем."""
@@ -2037,36 +2209,61 @@ class Catalog:
         self.p.alerts.send(f"🚷 Автоисключение кандидата {esc(cand['supplier_name'])} / "
                            f"{esc(cand['service_id'])}: {esc(reason)}", key=f"excl:{key}")
 
-    def select_candidates(self, lot: dict, qty: int, exclude: Optional[set] = None) -> list[dict]:
-        """Упорядоченный список кандидатов для заказа с учётом режима и исключений."""
+    def select_candidates(self, lot: dict, qty: int, exclude: Optional[set] = None,
+                          reasons: Optional[dict] = None) -> list[dict]:
+        """Упорядоченный список кандидатов для заказа с учётом режима и исключений.
+
+        reasons (если передан) собирает причины исключения: {код: количество} — для понятного автовозврата.
+        """
         exclude = exclude or set()
+        reasons = reasons if reasons is not None else {}
+
+        def skip(code: str) -> None:
+            reasons[code] = reasons.get(code, 0) + 1
+
         result = []
         min_rating = float(self.p.cfg.get("min_rating"))
-        for c in self.p.price.lot_candidates(lot["id"]):
+        for c in self.p.price.lot_candidates(lot["id"], usable_only=False):
             key = f"{c['supplier_id']}:{c['service_id']}"
             if key in exclude:
+                skip("tried")
+                continue
+            if not c["supplier_enabled"] or c["needs_key"] or c["supplier_name"] is None:
+                skip("no_api")
+                continue
+            if c["rate"] is None or c["disabled"]:
+                skip("service")
                 continue
             if not (int(c["min"] or 1) <= qty <= int(c["max"] or 10 ** 9)):
+                skip("qty")
                 continue
             s = self.p.sup.get(c["supplier_id"])
-            if not s:
+            if not s or not s.api_key:
+                skip("no_api")
                 continue
             if s.breaker.is_open:
+                skip("api_down")
                 self._notify_excluded(c, "circuit breaker")
                 continue
             rating, total = self.rating(c["supplier_id"], c["service_id"])
             if total >= 20 and rating < min_rating:
+                skip("no_supplier")
                 self._notify_excluded(c, f"рейтинг {rating:.2f} < {min_rating}")
                 continue
             try:
                 cost_rub = self.p.price.candidate_cost(c, qty)
             except Exception as e:
+                skip("fx")
                 log_warn(f"Кандидат {key}: нет цены ({e})")
                 continue
             native = D(c["rate"]) * D(qty) / D(s.rate_unit)
             if not self.p.dry:
                 bal, _cur = self.p.sup.balance(c["supplier_id"])
+                if bal is None and s.breaker.is_open:
+                    skip("api_down")
+                    continue
                 if bal is not None and bal < native:
+                    skip("no_balance")
                     self._notify_excluded(c, f"недостаточно баланса ({money(bal)} < {money(native)} {s.currency})")
                     continue
             result.append(dict(c, cost_rub=cost_rub, cost_native=native, rating=rating, orders_total=total))
@@ -2136,8 +2333,13 @@ def _yes_no(v: Any) -> str:
 
 
 def _parse_start(ctx: dict) -> str:
-    m = re.search(r"(?:старт|start)\s*[:\-]?\s*([0-9][^,|\]\)\n]{0,20})", ctx["svc"].get("name", ""), re.I)
-    return m.group(1).strip() if m else ctx["p"].cfg.get("default_start_time")
+    m = re.search(r"(?:старт|start)\s*[:\-]?\s*(\d+(?:[.,]\d+)?(?:\s*[-–]\s*\d+(?:[.,]\d+)?)?\s*"
+                  r"(?:ч|час[а-я]*|h|hours?|мин[а-я]*|min|m|д|дн[а-я]*|days?)?)", ctx["svc"].get("name", ""), re.I)
+    if m:
+        return m.group(1).strip()
+    if re.search(r"instant|мгновен", ctx["svc"].get("name", ""), re.I):
+        return "мгновенно"
+    return ctx["p"].cfg.get("default_start_time")
 
 
 def _parse_speed(ctx: dict) -> str:
@@ -2177,6 +2379,154 @@ LOT_CODE_RESOLVERS: dict[str, Callable[[dict], str]] = {
                                                                                 ctx["svc"]["service_id"]) else "",
     "platform": lambda ctx: (detect_platform(ctx["svc"].get("name"), ctx["svc"].get("category")) or ("SMM", ""))[0],
 }
+
+# Галерея готовых шаблонов: продающие заголовки и описания с кодовыми словами.
+_DESC_COMMON = (
+    "✅ Автоматический запуск 24/7 — сразу после оплаты пришлите ссылку в чат.\n"
+    "⏱ Старт: {start_time} | Скорость: {speed}\n"
+    "🛡 Гарантия: {guarantee}\n"
+    "📦 Количество: {quantity} шт.\n\n"
+    "Как заказать:\n"
+    "1. Оплатите лот (можно купить несколько штук — количество умножится).\n"
+    "2. Пришлите ссылку одним сообщением (https://...).\n"
+    "3. Подтвердите «+» — заказ запустится автоматически.\n\n"
+    "⚠️ Профиль/канал должен быть открытым. Не меняйте ссылку и не закрывайте профиль до завершения.\n"
+    "Статус заказа можно спросить в чате словом «статус»."
+)
+_DESC_COMMON_EN = (
+    "✅ Fully automatic 24/7 — send your link in chat right after payment.\n"
+    "⏱ Start: {start_time} | Speed: {speed}\n"
+    "🛡 Guarantee: {guarantee}\n"
+    "📦 Quantity: {quantity}\n\n"
+    "The profile/channel must be public. Type “status” in chat to check progress."
+)
+TEMPLATE_PRESETS: dict[str, dict] = {
+    "universal": {
+        "title": "🌐 Универсальный (любая платформа)",
+        "keywords": [],
+        "name": "Универсальный SMM",
+        "title_ru": "{badge} {platform} — {service_name} | {quantity} шт. | Автозапуск",
+        "title_en": "{platform} — {service_name} | {quantity} pcs | Auto start",
+        "desc_ru": "🚀 {service_name}\n\n" + _DESC_COMMON,
+        "desc_en": "🚀 {service_name}\n\n" + _DESC_COMMON_EN,
+        "price_mode": "per_1000",
+    },
+    "ig_followers": {
+        "node_hints": ["подписч"],
+        "title": "📸 Instagram — подписчики",
+        "keywords": ["instagram", "инстаграм"],
+        "name": "Instagram подписчики",
+        "title_ru": "{badge} Подписчики Instagram {quantity} шт. ⚡ Старт {start_time} 🛡 Гарантия {guarantee}",
+        "title_en": "Instagram Followers {quantity} ⚡ Start {start_time} 🛡 Refill {guarantee}",
+        "desc_ru": "👥 Подписчики в Instagram — {service_name}\n\n" + _DESC_COMMON +
+                   "\n\nПришлите ссылку на профиль: https://instagram.com/username",
+        "desc_en": "👥 Instagram followers\n\n" + _DESC_COMMON_EN,
+        "price_mode": "per_1000",
+    },
+    "ig_likes": {
+        "node_hints": ["лайк"],
+        "title": "❤️ Instagram — лайки / просмотры",
+        "keywords": ["instagram", "инстаграм"],
+        "name": "Instagram лайки",
+        "title_ru": "{badge} Лайки Instagram {quantity} шт. ⚡ Быстрый старт | Автовыдача",
+        "title_en": "Instagram Likes {quantity} ⚡ Fast start | Auto",
+        "desc_ru": "❤️ {service_name}\n\n" + _DESC_COMMON + "\n\nПришлите ссылку на пост/рилс.",
+        "desc_en": "❤️ Instagram likes\n\n" + _DESC_COMMON_EN,
+        "price_mode": "per_1000",
+    },
+    "tiktok": {
+        "node_hints": ["просмотр", "подписч"],
+        "title": "🎵 TikTok — просмотры / подписчики / лайки",
+        "keywords": ["tiktok", "тикток"],
+        "name": "TikTok",
+        "title_ru": "{badge} TikTok {service_name} — {quantity} шт. ⚡ Автозапуск",
+        "title_en": "TikTok {service_name} — {quantity} ⚡ Auto start",
+        "desc_ru": "🎵 {service_name}\n\n" + _DESC_COMMON + "\n\nПришлите ссылку на видео или профиль TikTok.",
+        "desc_en": "🎵 TikTok\n\n" + _DESC_COMMON_EN,
+        "price_mode": "per_1000",
+    },
+    "youtube": {
+        "node_hints": ["просмотр", "подписч"],
+        "title": "▶️ YouTube — просмотры / подписчики",
+        "keywords": ["youtube", "ютуб"],
+        "name": "YouTube",
+        "title_ru": "{badge} YouTube {service_name} — {quantity} шт. 🛡 {guarantee}",
+        "title_en": "YouTube {service_name} — {quantity} 🛡 {guarantee}",
+        "desc_ru": "▶️ {service_name}\n\n" + _DESC_COMMON + "\n\nПришлите ссылку на видео или канал YouTube.",
+        "desc_en": "▶️ YouTube\n\n" + _DESC_COMMON_EN,
+        "price_mode": "per_1000",
+    },
+    "telegram": {
+        "node_hints": ["подписч", "участник"],
+        "title": "✈️ Telegram — подписчики / просмотры",
+        "keywords": ["telegram", "телеграм"],
+        "name": "Telegram",
+        "title_ru": "{badge} Telegram {service_name} — {quantity} шт. ⚡ Старт {start_time}",
+        "title_en": "Telegram {service_name} — {quantity} ⚡ Start {start_time}",
+        "desc_ru": "✈️ {service_name}\n\n" + _DESC_COMMON +
+                   "\n\nПришлите ссылку на публичный канал/пост: https://t.me/channel",
+        "desc_en": "✈️ Telegram\n\n" + _DESC_COMMON_EN,
+        "price_mode": "per_1000",
+    },
+    "vk": {
+        "node_hints": ["подписч", "лайк"],
+        "title": "🔵 VK — подписчики / лайки",
+        "keywords": ["вконтакте", "vk"],
+        "name": "VK",
+        "title_ru": "{badge} ВКонтакте {service_name} — {quantity} шт. | Автозапуск",
+        "title_en": "VK {service_name} — {quantity} | Auto",
+        "desc_ru": "🔵 {service_name}\n\n" + _DESC_COMMON + "\n\nПришлите ссылку на страницу/группу/пост VK.",
+        "desc_en": "🔵 VK\n\n" + _DESC_COMMON_EN,
+        "price_mode": "per_1000",
+    },
+    "packs": {
+        "title": "📦 Пакеты (100 / 500 / 1000 / 5000)",
+        "keywords": [],
+        "name": "Пакеты",
+        "title_ru": "{badge} {platform} {service_name} — пакет {quantity} шт.",
+        "title_en": "{platform} {service_name} — {quantity} pack",
+        "desc_ru": "📦 Пакет {quantity} шт. — {service_name}\n\n" + _DESC_COMMON,
+        "desc_en": "📦 {quantity} pack\n\n" + _DESC_COMMON_EN,
+        "price_mode": "pack",
+        "quantity_pack": "100, 500, 1000, 5000",
+    },
+}
+for _p in TEMPLATE_PRESETS.values():
+    _p.setdefault("secrets_text", "")
+    _p.setdefault("quantity_pack", "")
+    _p.setdefault("autoreply_text", "Заказ #{order_id} запущен 🚀 Ожидаемое время: {eta}. Напишите «статус», "
+                                    "чтобы узнать прогресс.")
+
+# Синонимы для поиска категорий FunPay (кириллица/латиница/сленг).
+SEARCH_SYNONYMS = {
+    "тикток": ["tiktok", "тикток"], "tiktok": ["tiktok", "тикток"], "тик": ["tiktok", "тикток"],
+    "инстаграм": ["instagram", "инстаграм"], "инста": ["instagram", "инстаграм"], "insta": ["instagram"],
+    "instagram": ["instagram", "инстаграм"], "ютуб": ["youtube", "ютуб"], "youtube": ["youtube", "ютуб"],
+    "телеграм": ["telegram", "телеграм"], "тг": ["telegram", "телеграм"], "telegram": ["telegram", "телеграм"],
+    "вк": ["вконтакте", "vk"], "вконтакте": ["вконтакте", "vk"], "vk": ["vk", "вконтакте"],
+    "твиттер": ["twitter", "твиттер", " x "], "twitter": ["twitter", "твиттер"],
+    "подписчики": ["подписч", "follow", "subscri", "участник", "member"],
+    "лайки": ["лайк", "like", "реакц"], "просмотры": ["просмотр", "view"],
+}
+
+TEMPLATE_STEP_TIPS = {
+    "name": "Название видно только вам. Пример: «Instagram подписчики R30».",
+    "title_ru": "💡 Советы: начинайте с платформы и типа услуги (по ним ищут на FunPay), добавьте {quantity}, "
+                "гарантию {guarantee} и старт {start_time}. Держите до 100 символов — длиннее обрежется "
+                "автоматически.",
+    "title_en": "💡 Для англоязычных покупателей. «-» — скопировать русский.",
+    "desc_ru": "💡 Хорошее описание: что получит покупатель, сроки ({start_time}, {speed}), гарантия ({guarantee}), "
+               "инструкция «оплатите → пришлите ссылку → «+»», требование открытого профиля.",
+    "desc_en": "💡 Можно коротко. «-» — оставить пустым.",
+    "category_node": "💡 Можно ввести ID числом или просто текст: «instagram», «tiktok подписчики» — плагин найдёт "
+                     "подкатегории FunPay и покажет кнопки.",
+    "price_mode": "💡 «За 1000» — покупатель берёт N шт. лота = N×1000. «Пакеты» — отдельный лот на каждый объём. "
+                  "«За 1 шт.» — покупатель сам выбирает точное количество.",
+    "quantity_pack": "💡 Популярные объёмы продаются лучше: 100, 500, 1000, 5000.",
+    "secrets_text": "💡 Сообщение сразу после оплаты (например, инструкция). «-» — не отправлять.",
+    "autoreply_text": "💡 Отправляется при запуске заказа. Доступны {order_id} {eta} {quantity} {link}. «-» — без него.",
+}
+
 
 CODE_WORD_RX = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
 
@@ -2250,16 +2600,31 @@ class MasterLot:
             return 1
         return max(1, int(self.p.cfg.get("lot_unit")))
 
-    def build(self, template: dict, sid: int, svc: dict, pack: int = 0, lot: Optional[dict] = None) -> dict:
-        """Готовые поля лота: заголовки, описания, цена, расчёт."""
+    @staticmethod
+    def trim_title(text: str, limit: int) -> str:
+        """Обрезает заголовок по границе слова, не ломая смысл."""
+        if limit <= 0 or len(text) <= limit:
+            return text
+        cut = text[:limit + 1].rsplit(" ", 1)[0].rstrip(" ,.;:-—|/")
+        return cut if len(cut) >= limit * 0.6 else text[:limit].rstrip()
+
+    def build(self, template: dict, sid: int, svc: dict, pack: int = 0, lot: Optional[dict] = None,
+              margin: Optional[Decimal] = None) -> dict:
+        """Готовые поля лота: заголовки, описания, цена, расчёт, предупреждения.
+
+        margin — наценка, выбранная при запуске мастер-лота (сохраняется в лот как margin_override).
+        """
         supplier = self.p.sup.row(sid) or {"id": sid, "name": f"#{sid}"}
         unit = self.unit_for(template, pack)
+        eff = lot
+        if margin is not None:
+            eff = dict(lot or {}, margin_override=str(margin))
         calc = None
         if lot:
-            calc = self.p.price.calc_lot(lot)
+            calc = self.p.price.calc_lot(eff)
         if not calc:
-            calc = self.p.price.calc_service(sid, svc, unit, lot)
-        per_1k = self.p.price.calc_service(sid, svc, 1000, lot)["price"]
+            calc = self.p.price.calc_service(sid, svc, unit, eff)
+        per_1k = self.p.price.calc_service(sid, svc, 1000, eff)["price"]
         ctx = {"p": self.p, "svc": dict(svc), "supplier": supplier, "template": template, "unit": unit,
                "price_per_1k": per_1k, "marker": self.marker(sid, svc["service_id"], pack)}
         unknown: set = set()
@@ -2273,12 +2638,26 @@ class MasterLot:
             out[key] = re.sub(r"[ \t]+", " ", text).strip()
         if not out["title_en"]:
             out["title_en"] = out["title_ru"]
+        limit = int(self.p.cfg.get("masterlot.title_limit"))
+        warns: list[str] = []
+        for key in ("title_ru", "title_en"):
+            trimmed = self.trim_title(out[key], limit)
+            if trimmed != out[key]:
+                out[key] = trimmed
+                if key == "title_ru":
+                    warns.append(f"заголовок обрезан до {limit} символов")
         if self.p.cfg.get("desc_marker") and "{id}" not in (template.get("desc_ru") or ""):
             out["desc_ru"] = (out["desc_ru"] + f"\n\n{ctx['marker']}").strip()
             if out["desc_en"]:
                 out["desc_en"] = (out["desc_en"] + f"\n\n{ctx['marker']}").strip()
+        skip = None
+        if calc["price"] < D(self.p.cfg.get("masterlot.min_price")):
+            skip = f"цена {money(calc['price'])} ₽ ниже минимальной"
+        elif calc["profit"] <= 0 and self.p.cfg.get("masterlot.skip_unprofitable"):
+            skip = f"убыточно (прибыль {money(calc['profit'])} ₽)"
         out.update({"price": calc["price"], "cost": calc["cost"], "profit": calc["profit"], "unit": unit,
-                    "margin": calc["margin"], "unknown": unknown, "marker": ctx["marker"]})
+                    "margin": calc["margin"], "unknown": unknown, "marker": ctx["marker"], "warns": warns,
+                    "skip": skip})
         return out
 
     def select_services(self, sid: int, mode: str, arg: Any) -> list[dict]:
@@ -2301,6 +2680,44 @@ class MasterLot:
                 result.append(s)
         return result
 
+    def recommend(self, sid: int, category: str, tid: int, n: int = 5) -> list[dict]:
+        """Авто-подбор лучших услуг категории с объяснением выбора."""
+        t = self.template(tid) or {}
+        unit = self.packs(t)[0] or self.unit_for(t, 0)
+        items = [s for s in self.p.sup.services(sid, category=category, include_disabled=False)
+                 if int(s["min"] or 1) <= unit <= int(s["max"] or 10 ** 9)]
+        if not items:
+            return []
+        picks: dict[str, dict] = {}
+
+        def add(svc: Optional[dict], why: str) -> None:
+            if svc and svc["service_id"] not in picks and len(picks) < n:
+                picks[svc["service_id"]] = dict(svc, why=why)
+
+        def guarantee_days(s: dict) -> int:
+            m = re.search(r"\bR\s?(\d{1,3})\b", s["name"]) or re.search(r"(\d{1,3})\s*(?:дн|day)", s["name"], re.I)
+            return int(m.group(1)) if m else (365 if re.search(r"lifetime|навсегда", s["name"], re.I) else 0)
+
+        by_price = sorted(items, key=lambda s: D(s["rate"]))
+        refill = [s for s in by_price if to_bool(s["refill"])]
+        rated = []
+        for s in items:
+            rating, total = self.p.cat.rating(sid, s["service_id"])
+            if total >= 10:
+                rated.append((rating, s))
+        add(by_price[0], "самая дешёвая — максимум продаж за счёт цены")
+        add(refill[0] if refill else None, "самая дешёвая с гарантией докрутки — меньше жалоб")
+        if rated:
+            best = max(rated, key=lambda x: x[0])
+            add(best[1], f"лучший рейтинг по вашим заказам ({best[0]:.2f})")
+        longest = max(items, key=lambda s: (guarantee_days(s), -D(s["rate"])))
+        if guarantee_days(longest):
+            add(longest, f"самая долгая гарантия ({guarantee_days(longest)} дн.) — премиум-лот")
+        add(by_price[len(by_price) // 2], "средняя цена — баланс цены и качества")
+        for s in by_price:
+            add(s, "следующая по цене")
+        return list(picks.values())
+
     def items(self, template: dict, services: list[dict]) -> list[tuple[dict, int]]:
         result = []
         for s in services:
@@ -2310,25 +2727,48 @@ class MasterLot:
                 result.append((s, pack))
         return result
 
-    def preview(self, tid: int, sid: int, services: list[dict], n: int = 3) -> str:
-        """Предпросмотр первых n лотов."""
+    def preview(self, tid: int, sid: int, services: list[dict], n: int = 3, margin: Optional[Decimal] = None) -> str:
+        """Предпросмотр первых n лотов + сводка по всей пачке (новые/обновления/пропуски, прибыль)."""
         t = self.template(tid)
         if not t:
             return "Шаблон не найден."
         items = self.items(t, services)
-        lines = [f"<b>Предпросмотр</b> — шаблон «{esc(t['name'])}», лотов к обработке: {len(items)}"]
+        margin_txt = f"{margin}% (выбрана при запуске)" if margin is not None else \
+            f"по умолчанию/категории ({self.p.cfg.get('margin_default')}%)"
+        lines = [f"<b>Предпросмотр</b> — шаблон «{esc(t['name'])}», лотов к обработке: {len(items)}",
+                 f"Наценка: <b>{esc(margin_txt)}</b> — чистыми сверх себестоимости, комиссии FP/вывода уже учтены."]
         unknown: set = set()
-        for s, pack in items[:n]:
+        stats = {"new": 0, "upd": 0, "skip": 0, "profit": Decimal("0"), "warn": 0}
+        skipped: list[str] = []
+        for i, (s, pack) in enumerate(items):
             existing = self.find_lot(tid, sid, s["service_id"], pack)
             try:
-                b = self.build(t, sid, s, pack, existing)
+                b = self.build(t, sid, s, pack, existing, margin)
             except Exception as e:
-                lines.append(f"\n❌ {esc(s['service_id'])}: {esc(e)}")
+                if i < n:
+                    lines.append(f"\n❌ {esc(s['service_id'])}: {esc(e)}")
                 continue
             unknown |= b["unknown"]
-            lines.append(f"\n<b>{esc(b['title_ru'][:150])}</b>\n{esc(b['desc_ru'][:300])}\n"
-                         f"Цена: <b>{money(b['price'])} ₽</b> за {b['unit']} | себестоимость {money(b['cost'])} ₽ | "
-                         f"прибыль {money(b['profit'])} ₽ | {'обновление' if existing else 'новый'}")
+            if b["skip"]:
+                stats["skip"] += 1
+                skipped.append(f"{s['service_id']}: {b['skip']}")
+                continue
+            stats["upd" if existing else "new"] += 1
+            stats["profit"] += b["profit"]
+            stats["warn"] += 1 if b["warns"] else 0
+            if i < n:
+                warn = ("\n⚠️ " + "; ".join(b["warns"])) if b["warns"] else ""
+                lines.append(f"\n<b>{esc(b['title_ru'][:150])}</b>\n{esc(b['desc_ru'][:300])}\n"
+                             f"Цена: <b>{money(b['price'])} ₽</b> за {b['unit']} | себестоимость {money(b['cost'])} ₽ | "
+                             f"прибыль {money(b['profit'])} ₽ | {'обновление' if existing else 'новый'}{warn}")
+        lines.append(f"\n<b>Итого:</b> новых {stats['new']}, обновлений {stats['upd']}, будет пропущено "
+                     f"{stats['skip']}. Средняя прибыль с продажи: "
+                     f"{money(stats['profit'] / max(1, stats['new'] + stats['upd']))} ₽")
+        if stats["warn"]:
+            lines.append(f"✂️ Заголовков будет обрезано: {stats['warn']} (лимит "
+                         f"{self.p.cfg.get('masterlot.title_limit')} симв.)")
+        if skipped:
+            lines.append("Пропуски: " + esc("; ".join(skipped[:5])) + (" …" if len(skipped) > 5 else ""))
         if unknown:
             lines.append("\n⚠️ Неизвестные кодовые слова: " + ", ".join("{" + esc(u) + "}" for u in sorted(unknown)))
         if self.p.dry:
@@ -2340,7 +2780,7 @@ class MasterLot:
                              "pack_qty=?", (tid, sid, str(svc), pack))
 
     def run(self, tid: int, sid: int, services: list[dict],
-            progress: Optional[Callable[[int, int, dict], None]] = None) -> dict:
+            progress: Optional[Callable[[int, int, dict], None]] = None, margin: Optional[Decimal] = None) -> dict:
         """Публикация/обновление пачки лотов; ошибка одного лота не останавливает пачку."""
         t = self.template(tid)
         report = {"created": 0, "updated": 0, "skipped": 0, "errors": [], "unknown": set(), "total": 0}
@@ -2353,8 +2793,10 @@ class MasterLot:
             if self.p.stop.is_set():
                 break
             try:
-                res, _lot_id, info = self.upsert(t, sid, s, pack)
+                res, _lot_id, info = self.upsert(t, sid, s, pack, margin)
                 report[res] += 1
+                if info.get("reason") and res == "skipped" and info["reason"] != "без изменений":
+                    report["errors"].append(f"{s['service_id']}: пропущен — {info['reason']}")
                 report["unknown"] |= info.get("unknown", set())
                 if res != "skipped":
                     time.sleep(float(self.p.cfg.get("fp_pause")))
@@ -2369,11 +2811,16 @@ class MasterLot:
                     pass
         return report
 
-    def upsert(self, template: dict, sid: int, svc: dict, pack: int = 0) -> tuple[str, Optional[int], dict]:
+    def upsert(self, template: dict, sid: int, svc: dict, pack: int = 0,
+               margin: Optional[Decimal] = None) -> tuple[str, Optional[int], dict]:
         """Ключ лота = (template_id, supplier_id, service_id[, pack]). Обновляет только разницу."""
         lot = self.find_lot(template["id"], sid, svc["service_id"], pack)
-        b = self.build(template, sid, svc, pack, lot)
+        b = self.build(template, sid, svc, pack, lot, margin)
         info = {"unknown": b["unknown"]}
+        if b["skip"]:
+            return "skipped", lot["id"] if lot else None, dict(info, reason=b["skip"])
+        if margin is not None and lot and not self.p.dry:
+            self.p.db.execute("UPDATE lots SET margin_override=? WHERE id=?", (str(margin), lot["id"]))
         fields = {"title_ru": b["title_ru"], "title_en": b["title_en"], "desc_ru": b["desc_ru"],
                   "desc_en": b["desc_en"], "price": b["price"]}
         node = int(template.get("category_node") or 0)
@@ -2413,6 +2860,13 @@ class MasterLot:
                 (fp_id, node, template["id"], b["title_ru"], ts, ts, pack, sid, str(svc["service_id"]),
                  str(b["price"]), b["desc_ru"]))
         self._ensure_candidate(lot_id, sid, svc["service_id"], primary=True)
+        if margin is not None:
+            self.p.db.execute("UPDATE lots SET margin_override=? WHERE id=?", (str(margin), lot_id))
+        if self.p.cfg.get("auto.auto_alternatives"):
+            try:
+                self.p.auto.attach_alternatives(self.p.db.one("SELECT * FROM lots WHERE id=?", (lot_id,)))
+            except Exception:
+                log_error("Автоподбор запасных поставщиков", exc=True)
         log_info(f"Создан лот FP {fp_id}: {b['title_ru'][:60]}")
         return "created", lot_id, info
 
@@ -2561,7 +3015,8 @@ class Messenger:
         return {ORDER_NEW: "в очереди", ORDER_WAIT_LINK: "ожидает ссылку", ORDER_WAIT_CONFIRM: "ожидает подтверждения",
                 ORDER_SENDING: "запускается", ORDER_IN_PROGRESS: "выполняется", ORDER_COMPLETED: "выполнен",
                 ORDER_PARTIAL: "выполнен частично", ORDER_CANCELED: "отменён", ORDER_FAILED: "ошибка",
-                ORDER_REFUNDED: "возврат", ORDER_CLOSED: "закрыт"}.get(order.get("status"), str(order.get("status")))
+                ORDER_REFUNDED: "возврат", ORDER_CLOSED: "закрыт", ORDER_UNCERTAIN: "проверяется",
+                ORDER_REFUND_PENDING: "оформляется возврат"}.get(order.get("status"), str(order.get("status")))
 
     def send_raw(self, chat_id: Any, buyer: str, text: str) -> bool:
         if not text or chat_id in (None, ""):
@@ -2630,9 +3085,10 @@ class OrderManager:
         return self.get(oid)
 
     def active_for_buyer(self, buyer: str, exclude_id: int = 0) -> int:
+        statuses = (ORDER_WAIT_LINK,) + BUSY_ORDER_STATUSES
         return int(self.p.db.scalar(
-            "SELECT COUNT(*) FROM orders WHERE buyer=? AND id<>? AND status IN (?,?,?,?)",
-            (buyer, exclude_id, ORDER_WAIT_LINK, ORDER_WAIT_CONFIRM, ORDER_SENDING, ORDER_IN_PROGRESS), 0))
+            f"SELECT COUNT(*) FROM orders WHERE buyer=? AND id<>? AND status IN ({','.join('?' * len(statuses))})",
+            (buyer, exclude_id) + statuses, 0))
 
     def lot_of(self, order: dict) -> Optional[dict]:
         return self.p.db.one("SELECT * FROM lots WHERE id=?", (order["lot_id"],)) if order.get("lot_id") else None
@@ -2698,20 +3154,36 @@ class OrderManager:
         self.p.db.execute("UPDATE lots SET last_sale_at=?, discount_active=0 WHERE id=?", (now_ts(), lot["id"]))
         self.add_event(order["id"], "created", f"lot={lot['id']} amount={amount} qty={qty} price={o.price}")
         log_info(f"Новый заказ #{o.id} от {o.buyer_username}: лот {lot['id']}, {qty} шт.")
+        if self.p.cfg.get("auto.notify_new_orders"):
+            self.p.alerts.send(f"🆕 Заказ #{esc(o.id)} от {esc(o.buyer_username)}: {esc(lot['title'][:60])}, "
+                               f"{qty} шт., {money(o.price)} ₽", kb=self.p.ui.order_kb(order["id"]))
         bl = self.p.db.one("SELECT * FROM blacklist WHERE buyer=?", (o.buyer_username,))
         if bl:
-            self.set_status(order["id"], ORDER_FAILED, "покупатель в чёрном списке", error="blacklist", problem=1)
+            self.update(order["id"], error="blacklist")
             self.p.alerts.send(f"⛔ Заказ #{esc(o.id)} от покупателя из ЧС {esc(o.buyer_username)} "
                                f"({esc(bl['reason'] or '')}).", kb=self.p.ui.order_kb(order["id"]))
             if self.p.cfg.get("blacklist_refund"):
-                self.refund_full(self.get(order["id"]), "чёрный список", notify_buyer=False)
+                self.refund_full(self.get(order["id"]), "blacklist", notify_buyer=False, code="blacklist")
+            else:
+                self.set_status(order["id"], ORDER_FAILED, "покупатель в чёрном списке", problem=1)
             return
-        cands = self.p.price.lot_candidates(lot["id"])
-        if not any(int(c["min"] or 1) <= qty <= int(c["max"] or 10 ** 9) for c in cands):
-            self.update(order["id"], problem=1, error="qty_out_of_range")
+        per_hour = int(self.p.cfg.get("auto.max_orders_per_buyer_hour"))
+        if per_hour:
+            recent = int(self.p.db.scalar("SELECT COUNT(*) FROM orders WHERE buyer=? AND created_at>=?",
+                                          (o.buyer_username, now_ts() - 3600), 0))
+            if recent > per_hour:
+                self.refund_full(self.get(order["id"]), "лимит заказов в час", code="limit")
+                return
+        cands = self.p.price.lot_candidates(lot["id"], usable_only=False)
+        if cands and not any(int(c["min"] or 1) <= qty <= int(c["max"] or 10 ** 9) for c in cands
+                             if c["rate"] is not None):
             self.add_event(order["id"], "problem", "количество вне min/max всех кандидатов")
-            self.p.alerts.send(f"⚠️ Заказ #{esc(o.id)}: количество {qty} вне пределов min/max услуг лота.",
-                               kb=self.p.ui.order_kb(order["id"]))
+            if self.p.cfg.get("auto.refund_on_fail"):
+                self.refund_full(self.get(order["id"]), "количество вне min/max", code="qty")
+            else:
+                self.update(order["id"], problem=1, error="qty_out_of_range")
+                self.p.alerts.send(f"⚠️ Заказ #{esc(o.id)}: количество {qty} вне пределов min/max услуг лота.",
+                                   kb=self.p.ui.order_kb(order["id"]))
             return
         self.try_start(self.get(order["id"]))
 
@@ -2724,7 +3196,7 @@ class OrderManager:
                 self.add_event(order["id"], "queued_limit", f"лимит {limit}")
                 self.p.msg.send(order, "queued_limit")
             return
-        order = self.set_status(order["id"], ORDER_WAIT_LINK)
+        order = self.set_status(order["id"], ORDER_WAIT_LINK, confirm_deadline=now_ts(), link_reminded=0)
         lot = self.lot_of(order)
         self.p.msg.send(order, "accepted")
         secrets_text, _ = self.lot_texts(lot) if lot else ("", "")
@@ -2734,7 +3206,7 @@ class OrderManager:
 
     # ── сообщения покупателя ──
     def handle_message(self, event: NewMessageEvent) -> None:
-        """BIND_TO_NEW_MESSAGE: ссылка, подтверждение, промокод, вопрос о статусе."""
+        """BIND_TO_NEW_MESSAGE: ссылка, подтверждение, промокод, докрутка, вопрос о статусе."""
         m = event.message
         if not m.text or m.by_bot or not m.author_id:
             return
@@ -2751,30 +3223,51 @@ class OrderManager:
                                     (chat_id, ORDER_WAIT_LINK, ORDER_WAIT_CONFIRM))
             if waiting:
                 if waiting["status"] == ORDER_WAIT_LINK:
-                    self.process_link(waiting, text)
+                    if URL_RX.search(text) or not self._is_chatter(text):
+                        self.process_link(waiting, text)
                     return
-                if text in ("+", "＋", "да", "Да", "ok", "ок", "Ок"):
-                    self.set_status(waiting["id"], ORDER_SENDING, "подтверждено покупателем")
-                    self.add_event(waiting["id"], "confirmed", "")
+                if text in ("+", "＋", "да", "Да", "ok", "ок", "Ок", "OK", "Ok"):
+                    # Повторный «+» не создаёт второй отправки: статус меняется только из WAIT_CONFIRM.
+                    if self.p.db.rowcount("UPDATE orders SET status=?, updated_at=? WHERE id=? AND status=?",
+                                          (ORDER_SENDING, now_ts(), waiting["id"], ORDER_WAIT_CONFIRM)):
+                        self.add_event(waiting["id"], "status", f"{ORDER_WAIT_CONFIRM} -> {ORDER_SENDING}: "
+                                                               f"подтверждено покупателем")
+                        self.add_event(waiting["id"], "confirmed", "")
                     return
                 if text in ("-", "−", "нет", "Нет"):
                     self.set_status(waiting["id"], ORDER_WAIT_LINK, "покупатель меняет ссылку", link=None,
-                                    link_attempts=0)
+                                    link_attempts=0, confirm_deadline=now_ts(), link_reminded=0)
                     self.p.msg.send(self.get(waiting["id"]), "ask_link")
                     return
                 if URL_RX.search(text):
                     self.process_link(waiting, text)
                     return
+        if self.p.cfg.get("auto.refill_requests"):
+            try:
+                rrx = re.compile(self.p.cfg.get("auto.refill_regex"), re.I)
+            except re.error:
+                rrx = re.compile(DEFAULTS["auto"]["refill_regex"], re.I)
+            if rrx.search(text):
+                self.handle_refill_request(chat_id)
+                return
         try:
             rx = re.compile(self.p.cfg.get("status_regex"), re.I)
         except re.error:
             rx = re.compile(DEFAULTS["status_regex"], re.I)
         if rx.search(text):
-            order = self.p.db.one("SELECT * FROM orders WHERE chat_id=? AND status IN (?,?,?) ORDER BY id DESC "
-                                  "LIMIT 1", (chat_id, ORDER_NEW, ORDER_SENDING, ORDER_IN_PROGRESS))
+            order = self.p.db.one("SELECT * FROM orders WHERE chat_id=? AND status IN (?,?,?,?) ORDER BY id DESC "
+                                  "LIMIT 1", (chat_id, ORDER_NEW, ORDER_SENDING, ORDER_IN_PROGRESS, ORDER_UNCERTAIN))
             if order and now_ts() - int(order["last_status_reply"] or 0) >= int(self.p.cfg.get("status_reply_cooldown")):
                 self.update(order["id"], last_status_reply=now_ts())
                 self.p.msg.send(order, "status")
+
+    @staticmethod
+    def _is_chatter(text: str) -> bool:
+        """Короткие фразы вроде «привет», «ок, сейчас» не считаются попыткой отправить ссылку."""
+        t = text.strip().lower()
+        if "." in t and " " not in t:
+            return False
+        return len(t) < 40 and bool(re.match(r"^[\w\s,!?.)(:-]+$", t)) and not re.search(r"[/@]", t)
 
     def process_link(self, order: dict, text: str) -> None:
         m = URL_RX.search(text)
@@ -2790,6 +3283,9 @@ class OrderManager:
             self.update(order["id"], link_attempts=attempts)
             self.add_event(order["id"], "bad_link", f"{err}: {mask_link(link)}")
             if attempts >= int(self.p.cfg.get("link_attempts")):
+                if self.p.cfg.get("auto.link_attempts_refund"):
+                    self.refund_full(self.get(order["id"]), "попытки ввода ссылки", code="link_attempts")
+                    return
                 if not order["problem"]:
                     self.update(order["id"], problem=1, error="link_attempts")
                     self.p.alerts.send(f"🔗 Заказ #{esc(order['fp_order_id'])}: покупатель {esc(order['buyer'])} "
@@ -2797,8 +3293,9 @@ class OrderManager:
             self.p.msg.send(order, "bad_link", {"status": err})
             return
         limit = int(self.p.cfg.get("max_active_per_link"))
-        busy = int(self.p.db.scalar("SELECT COUNT(*) FROM orders WHERE link=? AND id<>? AND status IN (?,?,?)",
-                                    (link, order["id"], ORDER_WAIT_CONFIRM, ORDER_SENDING, ORDER_IN_PROGRESS), 0))
+        busy = int(self.p.db.scalar(
+            f"SELECT COUNT(*) FROM orders WHERE link=? AND id<>? AND status IN ({','.join('?' * len(BUSY_ORDER_STATUSES))})",
+            (link, order["id"]) + BUSY_ORDER_STATUSES, 0))
         if limit and busy >= limit:
             self.add_event(order["id"], "link_busy", mask_link(link))
             self.p.msg.send(order, "link_busy")
@@ -2813,18 +3310,57 @@ class OrderManager:
                               (chat_id, ORDER_NEW, ORDER_WAIT_LINK, ORDER_WAIT_CONFIRM))
         if not promo or not order or (promo["buyer"] and promo["buyer"] != buyer) or int(order["bonus_pct"] or 0):
             return
-        self.p.db.execute("UPDATE promo SET used=1 WHERE code=?", (code,))
+        # Атомарно: промокод используется ровно один раз даже при двойной отправке сообщения.
+        if not self.p.db.rowcount("UPDATE promo SET used=1 WHERE code=? AND used=0", (code,)):
+            return
         self.update(order["id"], bonus_pct=int(promo["percent"]))
         self.add_event(order["id"], "promo", f"{code} +{promo['percent']}%")
         self.p.msg.send(self.get(order["id"]), "promo_applied", {"progress": f"+{promo['percent']}%"})
 
+    def handle_refill_request(self, chat_id: str) -> None:
+        """Автодокрутка: покупатель пишет о списании — плагин сам отправляет refill поставщику."""
+        window = now_ts() - int(self.p.cfg.get("auto.refill_window_days")) * 86400
+        order = self.p.db.one("SELECT * FROM orders WHERE chat_id=? AND status IN (?,?,?) AND completed_at>=? "
+                              "AND supplier_order_id IS NOT NULL ORDER BY id DESC LIMIT 1",
+                              (chat_id, ORDER_COMPLETED, ORDER_CLOSED, ORDER_PARTIAL, window))
+        if not order:
+            return
+        cooldown = int(self.p.cfg.get("auto.refill_cooldown_hours")) * 3600
+        if order["last_refill_at"] and now_ts() - int(order["last_refill_at"]) < cooldown:
+            left = fmt_duration(cooldown - (now_ts() - int(order["last_refill_at"])))
+            self.p.msg.send(order, "refill_denied", {"status": f"повторный запрос возможен через {left}"})
+            return
+        svc = self.p.sup.service(order["supplier_id"], order["service_id"]) or {}
+        if not to_bool(svc.get("refill")):
+            self.p.msg.send(order, "refill_denied", {"status": "у этой услуги нет гарантии докрутки"})
+            return
+        s = self.p.sup.get(order["supplier_id"])
+        try:
+            res = s.refill(order["supplier_order_id"]) if s else None
+        except SupplierError as e:
+            self.add_event(order["id"], "refill_error", e.message)
+            self.p.alerts.send(f"♻️ Автодокрутка #{esc(order['fp_order_id'])} не удалась: {esc(e.message)}",
+                               kb=self.p.ui.order_kb(order["id"]))
+            return
+        self.update(order["id"], last_refill_at=now_ts())
+        self.add_event(order["id"], "refill", f"{order['supplier_id']}:{order['service_id']} "
+                                              f"{json.dumps(res, ensure_ascii=False)[:150]}")
+        self.p.msg.send(order, "refill_ok")
+
     # ── воркер ──
     def restore(self) -> None:
-        """После перезапуска: активные заказы восстанавливаются из базы."""
-        rows = self.p.db.query("SELECT id, status FROM orders WHERE status IN (?,?,?,?,?)", ACTIVE_ORDER_STATUSES)
+        """После перезапуска: активные заказы восстанавливаются из базы.
+
+        Заказ, у которого отправка поставщику началась, но результат не записан (сбой посреди create_order),
+        не отправляется повторно автоматически — он уходит в UNCERTAIN на решение админа.
+        """
+        rows = self.p.db.query(f"SELECT * FROM orders WHERE status IN "
+                               f"({','.join('?' * len(ACTIVE_ORDER_STATUSES))})", ACTIVE_ORDER_STATUSES)
         for r in rows:
             if r["status"] == ORDER_IN_PROGRESS:
                 self.update(r["id"], next_poll_at=now_ts())
+            elif r["status"] == ORDER_SENDING and r["send_started_at"]:
+                self.mark_uncertain(r, "перезапуск во время отправки поставщику")
             self.add_event(r["id"], "restored", r["status"])
         if rows:
             log_info(f"Восстановлено активных заказов: {len(rows)}")
@@ -2834,6 +3370,17 @@ class OrderManager:
         now = now_ts()
         for o in self.p.db.query("SELECT * FROM orders WHERE status=? AND problem=0 ORDER BY id", (ORDER_NEW,)):
             self.try_start(o)
+        link_timeout = int(self.p.cfg.get("auto.link_timeout_hours")) * 3600
+        if link_timeout:
+            for o in self.p.db.query("SELECT * FROM orders WHERE status=? AND confirm_deadline IS NOT NULL",
+                                     (ORDER_WAIT_LINK,)):
+                waited = now - int(o["confirm_deadline"] or o["created_at"])
+                if waited >= link_timeout:
+                    self.refund_full(o, "нет ссылки", code="link_timeout")
+                elif waited >= link_timeout // 2 and not o["link_reminded"]:
+                    self.update(o["id"], link_reminded=1)
+                    self.add_event(o["id"], "link_reminder", "")
+                    self.p.msg.send(o, "link_reminder")
         for o in self.p.db.query("SELECT * FROM orders WHERE status=? AND COALESCE(next_poll_at,0)<=? ORDER BY id",
                                  (ORDER_SENDING, now)):
             if self.p.stop.is_set():
@@ -2850,6 +3397,12 @@ class OrderManager:
                 self.add_event(o["id"], "reminder", "")
                 self.p.msg.send(o, "confirm_reminder")
             elif int(o["reminded"] or 0) == 1:
+                if self.p.cfg.get("auto.confirm_auto_start") and o["link"]:
+                    if self.p.db.rowcount("UPDATE orders SET status=?, reminded=2, updated_at=? WHERE id=? AND "
+                                          "status=?", (ORDER_SENDING, now, o["id"], ORDER_WAIT_CONFIRM)):
+                        self.add_event(o["id"], "status", f"{ORDER_WAIT_CONFIRM} -> {ORDER_SENDING}: автозапуск")
+                        self.p.msg.send(self.get(o["id"]), "auto_started")
+                    continue
                 self.update(o["id"], reminded=2, problem=1, error="confirm_timeout")
                 self.add_event(o["id"], "escalated", "нет подтверждения")
                 self.p.alerts.send(f"⏰ Заказ #{esc(o['fp_order_id'])}: покупатель не подтверждает "
@@ -2862,39 +3415,105 @@ class OrderManager:
                 fresh = self.get(o["id"])
                 if fresh and fresh["status"] == ORDER_IN_PROGRESS:
                     self.poll(fresh)
+        for o in self.p.db.query("SELECT * FROM orders WHERE status=? AND COALESCE(next_poll_at,0)<=?",
+                                 (ORDER_REFUND_PENDING, now)):
+            self.refund_full(o, o["refund_reason"] or "повтор возврата", code=o["error"] if o["error"] in
+                             REFUND_REASONS else None, retry=True)
+        unc_hours = int(self.p.cfg.get("auto.uncertain_refund_hours"))
+        if unc_hours:
+            for o in self.p.db.query("SELECT * FROM orders WHERE status=? AND updated_at<=?",
+                                     (ORDER_UNCERTAIN, now - unc_hours * 3600)):
+                self.refund_full(o, "неясная отправка", code="uncertain")
+        remind = int(self.p.cfg.get("auto.confirm_reminder_hours")) * 3600
+        if remind:
+            for o in self.p.db.query("SELECT * FROM orders WHERE status=? AND confirm_reminded=0 AND completed_at<=?",
+                                     (ORDER_COMPLETED, now - remind)):
+                self.update(o["id"], confirm_reminded=1)
+                self.p.msg.send(o, "confirm_please")
         stuck = int(self.p.cfg.get("alerts.stuck_hours")) * 3600
         for o in self.p.db.query("SELECT * FROM orders WHERE status IN (?,?) AND updated_at<? AND problem=0",
                                  (ORDER_SENDING, ORDER_IN_PROGRESS, now - stuck)):
             self.p.alerts.send(f"🐢 Заказ #{esc(o['fp_order_id'])} завис: {o['status']} больше "
                                f"{stuck // 3600} ч.", key=f"stuck:{o['id']}", kb=self.p.ui.order_kb(o["id"]))
 
+    @staticmethod
+    def pick_reason(reasons: dict, errors: list[str]) -> str:
+        """Самая понятная причина отказа из исключений кандидатов и ошибок поставщиков."""
+        merged = dict(reasons)
+        for e in errors:
+            merged[e] = merged.get(e, 0) + 1
+        for code in ("no_balance", "auth", "link", "service", "api_down", "no_api", "fx", "qty", "no_supplier"):
+            if merged.get(code):
+                return code
+        if any(e in TRANSIENT_CODES for e in errors):
+            return "api_down"
+        return "all_failed" if errors else "no_supplier"
+
+    def mark_uncertain(self, order: dict, reason: str) -> None:
+        """Отправка могла пройти, а могла нет: повтор = риск двойной выдачи, поэтому решает админ."""
+        self.set_status(order["id"], ORDER_UNCERTAIN, reason, problem=1, error="uncertain", send_started_at=None)
+        kb = K()
+        kb.row(B("✅ Заказ создан — ввести ID", callback_data=self.p.ui.cb("ounc", order["id"])),
+               B("🔁 Не создан — отправить", callback_data=self.p.ui.cb("oact", order["id"], "resend")))
+        kb.row(B("💸 Вернуть деньги", callback_data=self.p.ui.cb("oref", order["id"])),
+               B("🧾 Карточка", callback_data=self.p.ui.cb("od", order["id"])))
+        hours = int(self.p.cfg.get("auto.uncertain_refund_hours"))
+        self.p.alerts.send(f"❓ Заказ #{esc(order['fp_order_id'])}: {esc(reason)}.\nПроверьте в кабинете поставщика, "
+                           f"создан ли заказ на ссылку {esc(order.get('link') or '')}. Автоповтор отключён, чтобы не "
+                           f"выдать дважды." + (f"\nБез решения через {hours} ч — автовозврат." if hours else ""),
+                           kb=kb)
+
     def send_to_supplier(self, order: dict) -> None:
-        """SENDING: выбор кандидата и create_order с автоматическим fallback."""
+        """SENDING: выбор кандидата и create_order с автоматическим fallback и защитой от двойной отправки."""
         lot = self.lot_of(order)
         if not lot:
-            self.set_status(order["id"], ORDER_FAILED, "лот удалён", error="no_lot", problem=1)
+            self.refund_full(order, "лот удалён", code="no_supplier")
             return
         if not order.get("link"):
-            self.set_status(order["id"], ORDER_WAIT_LINK, "нет ссылки")
+            self.set_status(order["id"], ORDER_WAIT_LINK, "нет ссылки", confirm_deadline=now_ts())
+            return
+        if order.get("supplier_order_id"):
+            # Защита: у заказа уже есть номер у поставщика — повторно не отправляем.
+            self.set_status(order["id"], ORDER_IN_PROGRESS, "уже отправлен ранее", next_poll_at=now_ts())
             return
         qty = int(order["quantity"]) + int(order["quantity"]) * int(order["bonus_pct"] or 0) // 100
         tried = set(json.loads(order["tried"] or "[]"))
-        cands = self.p.cat.select_candidates(lot, qty, tried)
-        transient_only = True
+        reasons: dict = {}
+        try:
+            cands = self.p.cat.select_candidates(lot, qty, tried, reasons)
+        except SupplierError as e:
+            cands, reasons = [], {e.code: 1}
+        errors: list[str] = []
         for cand in cands:
             key = f"{cand['supplier_id']}:{cand['service_id']}"
             s = self.p.sup.get(cand["supplier_id"])
+            self.update(order["id"], send_started_at=now_ts())
+            self.add_event(order["id"], "send_attempt", f"{key} qty={qty}")
             try:
                 soid = s.create_order(cand["service_id"], order["link"], qty)
             except SupplierError as e:
+                if e.code == "uncertain":
+                    self.update(order["id"], supplier_id=cand["supplier_id"], service_id=str(cand["service_id"]),
+                                cost=str(cand["cost_rub"].quantize(Decimal("0.01"))))
+                    self.add_event(order["id"], "supplier_uncertain", f"{key} {e.message}")
+                    self.mark_uncertain(self.get(order["id"]), f"{s.name}: {e.message}")
+                    return
+                self.update(order["id"], send_started_at=None)
                 tried.add(key)
-                transient_only = transient_only and e.code in TRANSIENT_CODES
+                errors.append(e.code)
                 self.add_event(order["id"], "supplier_fail", f"{key} {e.code}: {e.message}")
                 self.p.sup.mark_error(cand["supplier_id"], e.message)
+                if e.code == "no_balance":
+                    self.p.sup.invalidate_balance(cand["supplier_id"])
+                    self.p.auto.on_no_balance(cand["supplier_id"])
+                elif e.code == "auth":
+                    self.p.alerts.send(f"🔑 {esc(s.name)}: ошибка авторизации API — {esc(e.message)}",
+                                       key=f"auth:{cand['supplier_id']}")
                 self.add_event(order["id"], "fallback", f"следующий кандидат после {key}")
                 continue
             tried.add(key)
             self.p.sup.mark_ok(cand["supplier_id"])
+            self.p.sup.invalidate_balance(cand["supplier_id"])
             eta = self.p.cat.eta_seconds(cand["supplier_id"], cand["service_id"], cand["category"] or "",
                                          cand["name"] or "")
             order = self.set_status(order["id"], ORDER_IN_PROGRESS, f"{s.name} #{soid}",
@@ -2902,7 +3521,8 @@ class OrderManager:
                                     supplier_order_id=soid, cost=str(cand["cost_rub"].quantize(Decimal("0.01"))),
                                     sent_at=now_ts(), next_poll_at=now_ts() + int(self.p.cfg.get("poll_interval")),
                                     eta_text=fmt_duration(eta), tried=json.dumps(sorted(tried)), poll_count=0,
-                                    remain=None, delayed_notified=0, error=None)
+                                    remain=None, delayed_notified=0, error=None, send_started_at=None,
+                                    first_error_at=None)
             self.add_event(order["id"], "sent", f"{key} supplier_order={soid} qty={qty}")
             self.p.msg.send(order, "in_progress")
             _, autoreply = self.lot_texts(lot)
@@ -2910,13 +3530,32 @@ class OrderManager:
                 self.p.msg.send_raw(order["chat_id"], order["buyer"], self.p.msg.render(
                     autoreply, self.p.msg.order_values(order)))
             return
-        retries = int(order["poll_count"] or 0)
-        if cands and transient_only and retries < 3:
-            self.update(order["id"], poll_count=retries + 1, next_poll_at=now_ts() + 120)
-            self.add_event(order["id"], "retry_later", "временные ошибки поставщиков")
+        code = self.pick_reason(reasons, errors)
+        # Сеть/пауза поставщика — временно: повторяем в окне transient_retry_min. Нет баланса, ключа или услуги —
+        # ждать бессмысленно: сразу автовозврат.
+        transient = code == "api_down" or (bool(errors) and all(e in TRANSIENT_CODES for e in errors))
+        first = int(order["first_error_at"] or now_ts())
+        window = int(self.p.cfg.get("auto.transient_retry_min")) * 60
+        if code == "link" and int(order["link_attempts"] or 0) < int(self.p.cfg.get("link_attempts")):
+            # Поставщик не принял ссылку — просим другую вместо возврата.
+            self.set_status(order["id"], ORDER_WAIT_LINK, "поставщик отклонил ссылку", link=None,
+                            link_attempts=int(order["link_attempts"] or 0) + 1, tried="[]",
+                            confirm_deadline=now_ts(), link_reminded=0)
+            self.p.msg.send(self.get(order["id"]), "bad_link",
+                            {"status": "сервис не принял ссылку — проверьте, что профиль открыт"})
             return
-        self.update(order["id"], tried=json.dumps(sorted(tried)))
-        self.refund_full(self.get(order["id"]), "нет доступных поставщиков" if not tried else "все поставщики отказали")
+        if transient and now_ts() - first < window:
+            # Временная проблема (сеть, пауза поставщика, ожидание пополнения) — повторяем позже.
+            self.update(order["id"], first_error_at=first, next_poll_at=now_ts() + 120, tried="[]")
+            self.add_event(order["id"], "retry_later", f"{code}: повтор через 2 мин")
+            return
+        self.update(order["id"], tried=json.dumps(sorted(tried)), first_error_at=None)
+        if self.p.cfg.get("auto.refund_on_fail"):
+            self.refund_full(self.get(order["id"]), REFUND_REASONS.get(code, ("", code))[1], code=code)
+        else:
+            self.set_status(order["id"], ORDER_FAILED, REFUND_REASONS.get(code, ("", code))[1], error=code, problem=1)
+            self.p.alerts.send(f"❌ Заказ #{esc(order['fp_order_id'])} не отправлен: "
+                               f"{esc(REFUND_REASONS.get(code, ('', code))[1])}", kb=self.p.ui.order_kb(order["id"]))
 
     def poll(self, order: dict) -> None:
         """IN_PROGRESS: опрос статуса у поставщика."""
@@ -2969,14 +3608,25 @@ class OrderManager:
         self.loyalty(order)
 
     def partial(self, order: dict, remain: int) -> None:
+        """Частичное выполнение: по политике — дозаказ остатка, затем возврат или решение админа."""
         qty = max(1, int(order["quantity"]))
         due = (D(order["price_paid"]) * D(remain) / D(qty)).quantize(Decimal("0.01"), rounding=ROUND_FLOOR)
+        self.p.cat.recompute_stats(order["supplier_id"], order["service_id"])
+        policy = self.p.cfg.get("auto.partial_policy")
+        reorders = int(self.p.db.scalar("SELECT COUNT(*) FROM order_events WHERE order_id=? AND "
+                                        "event='reorder_remain'", (order["id"],), 0))
+        if policy.startswith("reorder") and reorders < 2:
+            msg = self.reorder_remain(order, remain, exclude_current=True)
+            if msg is None:
+                return
+            self.add_event(order["id"], "reorder_failed", msg)
         order = self.set_status(order["id"], ORDER_PARTIAL, f"остаток {remain}, к возврату {due}",
                                 remain=remain, refund_due=str(due), completed_at=now_ts(), problem=1)
+        if policy in ("reorder_then_refund", "refund"):
+            # TODO: подтвердить метод Cardinal — частичного возврата в FunPayAPI нет, поэтому возвращается вся сумма.
+            self.refund_full(order, f"частичное выполнение (остаток {remain})", code="partial")
+            return
         self.p.msg.send(order, "partial")
-        self.p.cat.recompute_stats(order["supplier_id"], order["service_id"])
-        # TODO: подтвердить метод Cardinal — частичного возврата в FunPayAPI нет (refund() возвращает всю сумму),
-        # поэтому админ выбирает: полный возврат, дозаказ остатка у другого поставщика или ручное закрытие.
         kb = K()
         kb.row(B("💸 Полный возврат", callback_data=self.p.ui.cb("oref", order["id"])),
                B("🔁 Дозаказать остаток", callback_data=self.p.ui.cb("oact", order["id"], "reorder")))
@@ -2985,6 +3635,39 @@ class OrderManager:
         self.p.alerts.send(f"🌓 Заказ #{esc(order['fp_order_id'])} выполнен частично: остаток {remain} из {qty}.\n"
                            f"Рассчитанный возврат: <b>{money(due)} ₽</b> (оплачено {money(order['price_paid'])} ₽).",
                            kb=kb)
+
+    def reorder_remain(self, order: dict, remain: int, exclude_current: bool = False) -> Optional[str]:
+        """Дозаказ остатка у кандидата. None — успех, иначе текст причины."""
+        if remain <= 0 or not order.get("link"):
+            return "нет остатка или ссылки"
+        lot = self.lot_of(order)
+        if not lot:
+            return "лот удалён"
+        exclude = {f"{order['supplier_id']}:{order['service_id']}"} if exclude_current else set()
+        cands = self.p.cat.select_candidates(lot, remain, exclude)
+        if not cands and exclude_current:
+            cands = self.p.cat.select_candidates(lot, remain, set())
+        for cand in cands:
+            sup = self.p.sup.get(cand["supplier_id"])
+            key = f"{cand['supplier_id']}:{cand['service_id']}"
+            self.update(order["id"], send_started_at=now_ts())
+            try:
+                soid = sup.create_order(cand["service_id"], order["link"], remain)
+            except SupplierError as e:
+                self.update(order["id"], send_started_at=None)
+                if e.code == "uncertain":
+                    self.mark_uncertain(self.get(order["id"]), f"дозаказ остатка: {e.message}")
+                    return None
+                self.add_event(order["id"], "supplier_fail", f"{key} {e.code}: {e.message}")
+                continue
+            self.set_status(order["id"], ORDER_IN_PROGRESS, f"дозаказ остатка {remain}: {sup.name} #{soid}",
+                            supplier_id=cand["supplier_id"], service_id=str(cand["service_id"]),
+                            supplier_order_id=soid, sent_at=now_ts(), next_poll_at=now_ts() + 60,
+                            problem=0, refund_due=None, remain=None, send_started_at=None,
+                            cost=str(D(order["cost"]) + cand["cost_rub"].quantize(Decimal("0.01"))))
+            self.add_event(order["id"], "reorder_remain", f"{key} qty={remain}")
+            return None
+        return "нет кандидатов для дозаказа"
 
     def failover(self, order: dict, reason: str) -> None:
         """Отказ/ошибка поставщика → следующий кандидат (покупатель не уведомляется)."""
@@ -2997,27 +3680,58 @@ class OrderManager:
         self.set_status(order["id"], ORDER_SENDING, f"fallback: {reason}", tried=json.dumps(sorted(tried)),
                         supplier_order_id=None, poll_count=0, next_poll_at=now_ts())
 
-    def refund_full(self, order: dict, reason: str, notify_buyer: bool = True) -> bool:
-        """Полный возврат через FunPay."""
-        if self.p.dry:
-            log_info(f"[DRY-RUN] Возврат заказа #{order['fp_order_id']} ({reason})")
-        else:
-            try:
-                with self.p.fp_lock:
-                    self.p.c.account.refund(order["fp_order_id"])
-            except Exception as e:
-                log_error(f"Возврат заказа #{order['fp_order_id']} не удался: {e}", exc=True)
-                self.set_status(order["id"], ORDER_FAILED, f"возврат не удался: {e}", error=f"refund: {e}"[:300],
-                                problem=1)
-                self.p.alerts.send(f"❗ Не удалось вернуть деньги по заказу #{esc(order['fp_order_id'])}: "
-                                   f"{esc(str(e)[:200])}", kb=self.p.ui.order_kb(order["id"]))
-                return False
-        order = self.set_status(order["id"], ORDER_REFUNDED, reason, refunded_amount=str(order["price_paid"]),
-                                error=reason[:300])
+    def refund_full(self, order: dict, reason: str, notify_buyer: bool = True, code: Optional[str] = None,
+                    retry: bool = False) -> bool:
+        """Полный возврат через FunPay. Идемпотентен: один заказ возвращается не более одного раза.
+
+        code — причина из REFUND_REASONS (покупатель получит понятный текст автовозврата).
+        Если FunPay не принял возврат — заказ уходит в REFUND_PENDING и возврат повторяется автоматически.
+        """
+        with self.lock:
+            fresh = self.get(order["id"])
+            if not fresh or fresh["status"] == ORDER_REFUNDED:
+                return True
+            if fresh["status"] == ORDER_IN_PROGRESS and fresh["supplier_order_id"]:
+                s = self.p.sup.get(fresh["supplier_id"])
+                try:
+                    if s:
+                        s.cancel(fresh["supplier_order_id"])
+                        self.add_event(fresh["id"], "cancel_request", "перед возвратом")
+                except SupplierError as e:
+                    self.add_event(fresh["id"], "cancel_error", e.message)
+            if self.p.dry:
+                log_info(f"[DRY-RUN] Возврат заказа #{fresh['fp_order_id']} ({reason})")
+            else:
+                try:
+                    with self.p.fp_lock:
+                        self.p.c.account.refund(fresh["fp_order_id"])
+                except Exception as e:
+                    attempts = int(fresh["refund_attempts"] or 0) + 1
+                    log_error(f"Возврат заказа #{fresh['fp_order_id']} не удался ({attempts}): {e}", exc=True)
+                    if attempts < int(self.p.cfg.get("auto.refund_retry_max")):
+                        self.set_status(fresh["id"], ORDER_REFUND_PENDING, f"возврат не удался: {e}"[:200],
+                                        refund_attempts=attempts, refund_reason=reason, error=code or "refund",
+                                        next_poll_at=now_ts() + int(self.p.cfg.get("auto.refund_retry_min")) * 60)
+                        if attempts == 1:
+                            self.p.alerts.send(f"⌛ Возврат #{esc(fresh['fp_order_id'])} не прошёл, повторю "
+                                               f"автоматически: {esc(str(e)[:150])}", kb=self.p.ui.order_kb(fresh["id"]))
+                    else:
+                        self.set_status(fresh["id"], ORDER_FAILED, f"возврат не удался: {e}"[:200],
+                                        refund_attempts=attempts, error=f"refund: {e}"[:300], problem=1)
+                        self.p.alerts.send(f"❗ Не удалось вернуть деньги по заказу #{esc(fresh['fp_order_id'])} "
+                                           f"после {attempts} попыток: {esc(str(e)[:200])}",
+                                           kb=self.p.ui.order_kb(fresh["id"]))
+                    return False
+            order = self.set_status(fresh["id"], ORDER_REFUNDED, reason, refunded_amount=str(fresh["price_paid"]),
+                                    error=(code or reason)[:300], refund_reason=reason, send_started_at=None)
         if notify_buyer:
-            self.p.msg.send(order, "canceled")
-        self.p.alerts.send(f"💸 Заказ #{esc(order['fp_order_id'])}: полный возврат ({esc(reason)}).",
-                           key=f"refund:{order['id']}")
+            if code and code in REFUND_REASONS and code != "manual":
+                self.p.msg.send(order, "auto_refund", {"status": REFUND_REASONS[code][0]})
+            else:
+                self.p.msg.send(order, "canceled")
+        admin_reason = REFUND_REASONS[code][1] if code in REFUND_REASONS else reason
+        self.p.alerts.send(f"💸 Заказ #{esc(order['fp_order_id'])}: автовозврат {money(order['price_paid'])} ₽ — "
+                           f"{esc(admin_reason)}.", key=f"refund:{order['id']}")
         return True
 
     def loyalty(self, order: dict) -> None:
@@ -3064,24 +3778,36 @@ class OrderManager:
             self.set_status(row["id"], ORDER_REFUNDED, "возврат на FunPay", refunded_amount=str(row["price_paid"]))
 
     # ── ручные действия ──
-    def manual(self, oid: int, action: str) -> str:
-        """Ручные действия админа: retry, refill, cancel, refund, close, reorder, relink, unproblem."""
+    def manual(self, oid: int, action: str, arg: str = "") -> str:
+        """Ручные действия: retry, resend, refill, cancel, refund, close, reorder, relink, unproblem, set_sent."""
         o = self.get(oid)
         if not o:
             return "Заказ не найден."
         s = self.p.sup.get(o["supplier_id"]) if o.get("supplier_id") else None
-        self.add_event(oid, "manual", action)
+        self.add_event(oid, "manual", f"{action} {arg}".strip())
         try:
-            if action == "retry":
+            if action in ("retry", "resend"):
                 if not o["link"]:
                     return "У заказа нет ссылки."
+                if o["status"] == ORDER_IN_PROGRESS and o["supplier_order_id"]:
+                    return "Заказ уже выполняется у поставщика — повтор создаст дубль. Сначала отмените его."
                 self.set_status(oid, ORDER_SENDING, "повтор вручную", tried="[]", problem=0, error=None,
-                                poll_count=0, next_poll_at=0)
+                                poll_count=0, next_poll_at=0, supplier_order_id=None, send_started_at=None,
+                                first_error_at=None)
                 return "Заказ поставлен в очередь на отправку."
+            if action == "set_sent":
+                soid = arg.strip()
+                if not soid:
+                    return "Не указан номер заказа поставщика."
+                self.set_status(oid, ORDER_IN_PROGRESS, f"номер у поставщика указан вручную: {soid}",
+                                supplier_order_id=soid, sent_at=o["sent_at"] or now_ts(), next_poll_at=now_ts(),
+                                problem=0, error=None, send_started_at=None)
+                return f"Заказ привязан к #{esc(soid)} у поставщика, отслеживание продолжено."
             if action == "refill":
                 if not s or not o["supplier_order_id"]:
                     return "Нет заказа у поставщика."
                 res = s.refill(o["supplier_order_id"])
+                self.update(oid, last_refill_at=now_ts())
                 self.add_event(oid, "refill", f"{o['supplier_id']}:{o['service_id']} {json.dumps(res)[:200]}")
                 return f"Refill отправлен: {esc(json.dumps(res, ensure_ascii=False)[:200])}"
             if action == "cancel":
@@ -3091,7 +3817,10 @@ class OrderManager:
                 self.add_event(oid, "cancel_request", json.dumps(res, ensure_ascii=False)[:200])
                 return f"Запрос отмены отправлен: {esc(json.dumps(res, ensure_ascii=False)[:200])}"
             if action == "refund":
-                return "Возврат выполнен." if self.refund_full(o, "вручную") else "Возврат не удался, см. логи."
+                if o["status"] == ORDER_REFUNDED:
+                    return "Деньги по заказу уже возвращены."
+                return "Возврат выполнен." if self.refund_full(o, "вручную", code="manual") else \
+                    "Возврат не прошёл — будет повторён автоматически."
             if action == "close":
                 self.set_status(oid, ORDER_CLOSED, "закрыт вручную", problem=0)
                 return "Заказ закрыт."
@@ -3099,30 +3828,19 @@ class OrderManager:
                 self.update(oid, problem=0, error=None)
                 return "Отметка «проблемный» снята."
             if action == "relink":
-                self.set_status(oid, ORDER_WAIT_LINK, "запрос новой ссылки", link=None, link_attempts=0, problem=0)
+                self.set_status(oid, ORDER_WAIT_LINK, "запрос новой ссылки", link=None, link_attempts=0, problem=0,
+                                confirm_deadline=now_ts(), link_reminded=0)
                 self.p.msg.send(self.get(oid), "ask_link")
                 return "Покупателю отправлен запрос ссылки."
             if action == "reorder":
                 remain = int(o["remain"] or 0)
-                if remain <= 0 or not o["link"]:
-                    return "Нет остатка для дозаказа."
-                lot = self.lot_of(o)
-                cands = self.p.cat.select_candidates(lot, remain, set()) if lot else []
-                for cand in cands:
-                    sup = self.p.sup.get(cand["supplier_id"])
-                    try:
-                        soid = sup.create_order(cand["service_id"], o["link"], remain)
-                    except SupplierError as e:
-                        self.add_event(oid, "supplier_fail", f"{cand['supplier_id']}:{cand['service_id']} {e.message}")
-                        continue
-                    self.set_status(oid, ORDER_IN_PROGRESS, f"дозаказ остатка {remain}: {sup.name} #{soid}",
-                                    supplier_id=cand["supplier_id"], service_id=str(cand["service_id"]),
-                                    supplier_order_id=soid, sent_at=now_ts(), next_poll_at=now_ts() + 60,
-                                    problem=0, refund_due=None, remain=None,
-                                    cost=str(D(o["cost"]) + cand["cost_rub"].quantize(Decimal("0.01"))))
-                    self.add_event(oid, "reorder_remain", f"{cand['supplier_id']}:{cand['service_id']} qty={remain}")
-                    return f"Остаток {remain} дозаказан у {esc(sup.name)} (#{esc(soid)})."
-                return "Нет кандидатов для дозаказа остатка."
+                res = self.reorder_remain(o, remain)
+                if res is None:
+                    fresh = self.get(oid)
+                    if fresh["status"] == ORDER_UNCERTAIN:
+                        return "Результат дозаказа неясен — проверьте у поставщика."
+                    return f"Остаток {remain} дозаказан (#{esc(fresh['supplier_order_id'])})."
+                return f"Дозаказ не выполнен: {esc(res)}."
         except SupplierError as e:
             return f"Ошибка поставщика: {esc(e.message)}"
         return "Неизвестное действие."
@@ -3276,10 +3994,31 @@ class SyncManager:
                 log_info(f"Плагин обновлён {prev} -> {VERSION}. Лоты не перевыставляются, выполняется синхронизация.")
 
     def fp_lots(self) -> list:
+        """Все лоты аккаунта, включая неактивные (публичный профиль показывает только активные)."""
         with self.p.fp_lock:
             profile = self.p.c.account.get_user(self.p.c.account.id)
-        return [lot for lot in profile.get_lots() if lot.subcategory and
-                lot.subcategory.type is SubCategoryTypes.COMMON]
+        public = [lot for lot in profile.get_lots() if lot.subcategory and
+                  lot.subcategory.type is SubCategoryTypes.COMMON]
+        nodes = {int(l.subcategory.id) for l in public}
+        nodes |= {int(r["node_id"]) for r in self.p.db.query("SELECT DISTINCT node_id FROM lots WHERE node_id "
+                                                             "IS NOT NULL")}
+        result: dict[int, Any] = {}
+        for node in sorted(nodes):
+            try:
+                with self.p.fp_lock:
+                    mine = self.p.c.account.get_my_subcategory_lots(node)
+                time.sleep(0.5)
+            except Exception as e:
+                log_warn(f"Синхронизация: лоты подкатегории {node} не получены ({e}), беру публичный профиль")
+                mine = [l for l in public if int(l.subcategory.id) == node]
+            sub = None
+            for lot in mine:
+                if lot.subcategory is None:
+                    sub = sub or self.p.c.account.get_subcategory(SubCategoryTypes.COMMON, node)
+                    lot.subcategory = sub
+                if lot.subcategory is not None:
+                    result[int(lot.id)] = lot
+        return list(result.values())
 
     def run(self) -> str:
         """Синхронизация; возвращает текстовый отчёт."""
@@ -3450,7 +4189,7 @@ class Transfer:
                 z.write(path, name)
             os.remove(path)
             path = zpath
-        active = int(db.scalar(f"SELECT COUNT(*) FROM orders WHERE status IN ({','.join('?' * 5)})",
+        active = int(db.scalar(f"SELECT COUNT(*) FROM orders WHERE status IN ({','.join('?' * len(ACTIVE_ORDER_STATUSES))})",
                                ACTIVE_ORDER_STATUSES, 0))
         log_info(f"Экспорт создан: {os.path.basename(path)} (ключи: {'да' if include_keys and password else 'нет'})")
         return path, active
@@ -3989,12 +4728,15 @@ class TelegramUI:
     # ── главное меню ──
     def scr_main(self) -> tuple[str, K]:
         p = self.p
-        active = p.db.scalar(f"SELECT COUNT(*) FROM orders WHERE status IN ({','.join('?' * 5)})",
+        active = p.db.scalar(f"SELECT COUNT(*) FROM orders WHERE status IN ({','.join('?' * len(ACTIVE_ORDER_STATUSES))})",
                              ACTIVE_ORDER_STATUSES, 0)
         problems = p.db.scalar("SELECT COUNT(*) FROM orders WHERE problem=1 AND status NOT IN ('CLOSED','REFUNDED')",
                                (), 0)
         lots = p.db.scalar("SELECT COUNT(*) FROM lots WHERE fp_lot_id IS NOT NULL AND lost=0", (), 0)
         dry_line = "🧪 <b>DRY-RUN</b>: ничего не отправляется в FP и поставщикам\n" if p.dry else ""
+        paused = p.db.scalar("SELECT COUNT(*) FROM lots WHERE auto_paused IS NOT NULL", (), 0)
+        if paused:
+            dry_line += f"⏸ На автопаузе лотов: {paused} — пополните баланс поставщика, включатся сами\n"
         text = (f"<b>🤖 AutoSMMway v{VERSION}</b>\n{dry_line}"
                 f"Поставщиков: {len(p.sup.list(True))} | Лотов: {lots}\n"
                 f"Активных заказов: {active} | Проблемных: {problems}")
@@ -4207,10 +4949,87 @@ class TelegramUI:
         for t in self.p.ml.templates():
             cnt = self.p.db.scalar("SELECT COUNT(*) FROM lots WHERE template_id=?", (t["id"],), 0)
             kb.row(B(f"🏷 {t['name']} ({cnt})", callback_data=self.cb("t", t["id"])))
-        kb.row(B("➕ Новый шаблон", callback_data=self.cb("tn")), B("📋 Мои лоты", callback_data=self.cb("lots", 0)))
-        kb.row(B("🔤 Кодовые слова", callback_data=self.cb("cw")),
-               B("🔁 Синхронизировать", callback_data=self.cb("sync")))
-        return "<b>🏷 Мастер-лоты</b>\nШаблоны генерируют лоты для услуг поставщика.", self.nav(kb, self.cb("m"))
+        kb.row(B("🪄 Шаблон из галереи", callback_data=self.cb("tg")), B("➕ С нуля", callback_data=self.cb("tn")))
+        kb.row(B("📋 Мои лоты", callback_data=self.cb("lots", 0)), B("🔤 Кодовые слова", callback_data=self.cb("cw")))
+        kb.row(B("🔁 Синхронизировать", callback_data=self.cb("sync")))
+        text = ("<b>🏷 Мастер-лоты</b>\nШаблон превращает услуги поставщика в готовые лоты FunPay.\n\n"
+                "<b>Быстрый старт (2 минуты):</b>\n"
+                "1. «🪄 Шаблон из галереи» → выберите платформу.\n"
+                "2. Найдите категорию FunPay по названию (например «instagram»).\n"
+                "3. «🚀 Запуск» → поставщик → «⭐ Авто-подбор» или категория.\n"
+                "4. Выберите наценку (например 25%) → предпросмотр → опубликовать.\n"
+                "Дальше цены, паузы и замены поставщиков плагин ведёт сам.")
+        return text, self.nav(kb, self.cb("m"))
+
+    def r_tg(self, call: CallbackQuery, *args: str) -> tuple:
+        kb = K()
+        for key, preset in TEMPLATE_PRESETS.items():
+            kb.row(B(preset["title"], callback_data=self.cb("tgp", key)))
+        return ("<b>🪄 Галерея шаблонов</b>\nГотовые продающие заголовки и описания с кодовыми словами. "
+                "После выбора останется указать категорию FunPay — остальное можно поправить позже."), \
+            self.nav(kb, self.cb("ml"))
+
+    def r_tgp(self, call: CallbackQuery, key: str) -> Optional[tuple]:
+        preset = TEMPLATE_PRESETS[key]
+        tpl = {k: preset[k] for k in MasterLot.TEMPLATE_FIELDS if k in preset}
+        self.sess(call.from_user.id)["tpl"] = tpl
+        self.sess(call.from_user.id)["tpl_fast"] = True
+        self.sess(call.from_user.id)["tpl_keywords"] = preset.get("keywords") or []
+        self.sess(call.from_user.id)["tpl_hints"] = preset.get("node_hints") or []
+        step = [k for k, _p, _r in TEMPLATE_STEPS].index("category_node")
+        return self.tpl_step(call, call.from_user.id, step)
+
+    def example_text(self, text: str) -> str:
+        """Живой пример подстановки кодовых слов на реальной услуге из каталога."""
+        if not text:
+            return ""
+        sample = self.p.db.one("SELECT * FROM services WHERE disabled=0 ORDER BY refill DESC LIMIT 1")
+        if not sample:
+            return ""
+        sup = self.p.sup.row(sample["supplier_id"]) or {"id": sample["supplier_id"], "name": "?"}
+        try:
+            p1k = self.p.price.calc_service(sample["supplier_id"], sample, 1000)["price"]
+        except Exception:
+            p1k = Decimal("0")
+        ctx = {"p": self.p, "svc": sample, "supplier": sup, "template": {}, "unit": 1000, "price_per_1k": p1k,
+               "marker": MasterLot.marker(sample["supplier_id"], sample["service_id"])}
+        rendered, unknown = render_codewords(text, LOT_CODE_RESOLVERS, ctx)
+        res = esc(re.sub(r"[ \t]+", " ", rendered).strip()[:300])
+        if unknown:
+            res += "\n⚠️ Неизвестные слова: " + ", ".join("{" + esc(u) + "}" for u in sorted(unknown))
+        return res
+
+    def node_search(self, query: str, hints: Optional[list] = None) -> list:
+        """Поиск подкатегорий FunPay по тексту (с синонимами: «тикток» = «tiktok»); hints поднимают нужные выше."""
+        words = [w for w in norm_text(query).split() if w]
+        variants = [SEARCH_SYNONYMS.get(w, [w]) for w in words]
+        result = []
+        try:
+            subs = self.c.account.subcategories
+        except Exception:
+            subs = []
+        for sub in subs:
+            if sub.type is not SubCategoryTypes.COMMON:
+                continue
+            name = f" {norm_text(sub.fullname)} "
+            if all(any(v in name for v in group) for group in variants):
+                result.append(sub)
+        hints = [norm_text(h) for h in (hints or [])]
+
+        def rank(s: Any) -> tuple:
+            name = norm_text(s.fullname)
+            hit = next((i for i, h in enumerate(hints) if h in name), len(hints))
+            return hit, len(s.fullname), s.fullname
+
+        result.sort(key=rank)
+        return result[:PAGE_SIZE * 2]
+
+    def node_buttons(self, uid: int, subs: list, action: str, *extra: Any) -> K:
+        self.sess(uid)["node_results"] = [(s.id, s.fullname) for s in subs]
+        kb = K()
+        for i, s in enumerate(subs):
+            kb.row(B(f"{s.name} — {s.category.name}"[:60], callback_data=self.cb(action, *extra, i)))
+        return kb
 
     def r_cw(self, call: CallbackQuery, *args: str) -> tuple:
         sample = self.p.db.one("SELECT * FROM services WHERE disabled=0 LIMIT 1")
@@ -4245,29 +5064,65 @@ class TelegramUI:
         self.sess(call.from_user.id)["tpl"] = {}
         self.tpl_step(call, call.from_user.id, 0)
 
-    def tpl_step(self, target: Any, uid: int, step: int) -> Optional[tuple]:
-        data = self.sess(uid).setdefault("tpl", {})
+    def tpl_step(self, target: Any, uid: int, step: int, notice: str = "") -> Optional[tuple]:
+        sess = self.sess(uid)
+        data = sess.setdefault("tpl", {})
+        fast = sess.get("tpl_fast")
         while step < len(TEMPLATE_STEPS):
             key = TEMPLATE_STEPS[step][0]
             if key == "quantity_pack" and data.get("price_mode") != "pack":
                 step += 1
                 continue
+            if fast and key != "category_node" and key in data:
+                step += 1
+                continue
             break
         if step >= len(TEMPLATE_STEPS):
             tid = self.p.ml.save_template(data)
-            self.sess(uid).pop("tpl", None)
-            return self.scr_template(tid, "✅ Шаблон сохранён.")
+            for k in ("tpl", "tpl_fast", "tpl_keywords", "tpl_hints"):
+                sess.pop(k, None)
+            return self.scr_template(tid, "✅ Шаблон сохранён. Нажмите «🚀 Запуск», чтобы выставить лоты.")
         key, prompt, required = TEMPLATE_STEPS[step]
-        header = f"<b>Новый шаблон — шаг {step + 1}/{len(TEMPLATE_STEPS)}</b>\n"
+        header = (notice + "\n\n" if notice else "") + f"<b>Новый шаблон — шаг {step + 1}/{len(TEMPLATE_STEPS)}</b>\n"
+        tip = TEMPLATE_STEP_TIPS.get(key, "")
+        prev = {"title_en": "title_ru", "desc_ru": "title_ru", "desc_en": "desc_ru", "category_node": "desc_ru"}.get(key)
+        example = self.example_text(data.get(prev, "")) if prev and data.get(prev) else ""
+        body = prompt + (f"\n\n{tip}" if tip else "")
+        if example:
+            body += f"\n\n👁 Так будет выглядеть «{TEMPLATE_FIELD_TITLES.get(prev, prev)}»:\n<i>{example}</i>"
         if key == "price_mode":
             kb = K()
             for m, title in PRICE_MODE_TITLES.items():
                 kb.row(B(title, callback_data=self.cb("tpm", m, step)))
             kb.row(B("❌ Отмена", callback_data=self.cb("ml")))
-            self.show(target, header + prompt, kb)
+            self.show(target, header + body, kb)
             return None
-        self.ask(target, uid, header + prompt, "tpl_step", {"step": step}, self.cb("ml"))
+        if key == "category_node" and sess.get("tpl_keywords"):
+            subs = self.node_search(sess["tpl_keywords"][0], sess.get("tpl_hints"))
+            if subs:
+                kb = self.node_buttons(uid, subs, "tnode", step)
+                kb.row(B("❌ Отмена", callback_data=self.cb("ml")))
+                self.show(target, header + body + "\n\nПодходящие категории (или введите свой запрос/ID):", kb)
+                self.tg.set_state(*self._target_ids(target), uid, STATE_INPUT,
+                                  {"kind": "tpl_step", "step": step, "back": self.cb("ml")})
+                return None
+        self.ask(target, uid, header + body, "tpl_step", {"step": step}, self.cb("ml"))
         return None
+
+    @staticmethod
+    def _target_ids(target: Any) -> tuple[int, int]:
+        if isinstance(target, CallbackQuery):
+            return target.message.chat.id, target.message.id
+        return target[0], target[1]
+
+    def r_tnode(self, call: CallbackQuery, step: str, idx: str) -> Optional[tuple]:
+        res = self.sess(call.from_user.id).get("node_results") or []
+        if int(idx) >= len(res):
+            return None
+        self.tg.clear_state(call.message.chat.id, call.from_user.id)
+        node_id, name = res[int(idx)]
+        self.sess(call.from_user.id).setdefault("tpl", {})["category_node"] = int(node_id)
+        return self.tpl_step(call, call.from_user.id, int(step) + 1, f"✅ Категория: {esc(name)} (node {node_id})")
 
     def r_tpm(self, call: CallbackQuery, mode: str, step: str) -> None:
         self.sess(call.from_user.id).setdefault("tpl", {})["price_mode"] = mode
@@ -4282,11 +5137,24 @@ class TelegramUI:
         value: Any = "" if (text == "-" and not required) else text
         if key == "category_node":
             nums = re.findall(r"\d+", text)
-            if not nums:
-                self.ask(target, uid, "❗ Нужно число (ID подкатегории). Попробуйте ещё раз:", "tpl_step", data,
-                         self.cb("ml"))
+            if not nums or re.search(r"[a-zA-Zа-яА-ЯёЁ]{3,}", text) and "funpay" not in text.lower():
+                subs = self.node_search(text)
+                if not subs:
+                    self.ask(target, uid, f"🔍 По запросу «{esc(text)}» ничего не найдено. Введите другое название "
+                                          f"(например «instagram», «tiktok») или ID числом:", "tpl_step", data,
+                             self.cb("ml"))
+                    return None
+                kb = self.node_buttons(uid, subs, "tnode", step)
+                kb.row(B("❌ Отмена", callback_data=self.cb("ml")))
+                self.show(target, f"🔍 Найдено по «{esc(text)}» — выберите категорию (или введите другой запрос):", kb)
+                self.tg.set_state(target[0], target[1], uid, STATE_INPUT,
+                                  {"kind": "tpl_step", "step": step, "back": self.cb("ml")})
                 return None
             value = int(nums[-1])
+            sub = self.c.account.get_subcategory(SubCategoryTypes.COMMON, value)
+            if sub:
+                tpl[key] = value
+                return self.tpl_step(target, uid, step + 1, f"✅ Категория: {esc(sub.fullname)} (node {value})")
         if key == "quantity_pack" and not re.findall(r"\d+", text):
             self.ask(target, uid, "❗ Укажите хотя бы один пакет, например 100, 500, 1000:", "tpl_step", data,
                      self.cb("ml"))
@@ -4345,9 +5213,22 @@ class TelegramUI:
         key = data["key"]
         value: Any = "" if text == "-" else text
         if key == "category_node":
-            value = int(re.findall(r"\d+", text)[-1])
+            nums = re.findall(r"\d+", text)
+            if not nums:
+                subs = self.node_search(text)
+                if not subs:
+                    return f"🔍 По «{esc(text)}» ничего не найдено.", self.nav(K(), self.cb("te", data["tid"]))
+                kb = self.node_buttons(uid, subs, "tenode", data["tid"])
+                return "Выберите категорию для шаблона:", self.nav(kb, self.cb("te", data["tid"]))
+            value = int(nums[-1])
         self.p.ml.save_template({key: value}, data["tid"])
         return self.scr_template(data["tid"], "✅ Сохранено.")
+
+    def r_tenode(self, call: CallbackQuery, tid: str, idx: str) -> tuple:
+        res = self.sess(call.from_user.id).get("node_results") or []
+        node_id, name = res[int(idx)]
+        self.p.ml.save_template({"category_node": int(node_id)}, int(tid))
+        return self.scr_template(int(tid), f"✅ Категория: {esc(name)}")
 
     def r_td(self, call: CallbackQuery, tid: str) -> tuple:
         kb = K().row(B("🗑 Да, удалить", callback_data=self.cb("tdy", tid)),
@@ -4372,23 +5253,49 @@ class TelegramUI:
             self.bg(call, work, "⏳ Загружаю каталог…")
             return None
         kb = K()
+        kb.row(B("⭐ Авто-подбор лучших услуг", callback_data=self.cb("trm", tid, sid, "rec", 0)))
         kb.row(B("📂 Вся категория", callback_data=self.cb("trm", tid, sid, "cat", 0)))
         kb.row(B("☑️ Выбранные услуги", callback_data=self.cb("trm", tid, sid, "sel", 0)))
         kb.row(B("🔎 По фильтру", callback_data=self.cb("trf", tid, sid)))
         self.sess(call.from_user.id)["sel"] = set()
-        return "Режим запуска:", self.nav(kb, self.cb("tr", tid))
+        return ("Режим запуска:\n⭐ <b>Авто-подбор</b> — плагин сам выберет в категории до 5 лучших услуг: самую "
+                "дешёвую, самую дешёвую с гарантией, самую надёжную по статистике и т.д.\n"
+                "📂 Вся категория — лот на каждую услугу категории.\n☑️ Выбранные — отметить вручную.\n"
+                "🔎 Фильтр — по тексту и цене."), self.nav(kb, self.cb("tr", tid))
 
     def r_trm(self, call: CallbackQuery, tid: str, sid: str, mode: str, page: str = "0") -> tuple:
         cats = self.p.sup.categories(int(sid))
         kb = K()
-        act = "trc" if mode == "cat" else "trsc"
-        self.paginate(kb, list(enumerate(cats)), int(page),
-                      lambda it: B(it[1][:60], callback_data=self.cb(act, tid, sid, it[0], 0)),
+        act = {"cat": "trc", "rec": "trrec"}.get(mode, "trsc")
+        t = self.p.ml.template(int(tid)) or {}
+        plat = detect_platform(t.get("name"), t.get("title_ru"), t.get("desc_ru"))
+        items = list(enumerate(cats))
+        if plat:
+            keys = [k.strip() for k in next(p[1] for p in PLATFORMS if p[0] == plat[0])]
+            items.sort(key=lambda it: 0 if any(k in norm_text(it[1]) for k in keys) else 1)
+            match = lambda name: any(k in norm_text(name) for k in keys)  # noqa: E731
+        else:
+            match = lambda name: False  # noqa: E731
+        self.paginate(kb, items, int(page),
+                      lambda it: B(("🎯 " if match(it[1]) else "") + it[1][:58],
+                                   callback_data=self.cb(act, tid, sid, it[0], 0)),
                       lambda pg: self.cb("trm", tid, sid, mode, pg))
         if mode == "sel":
             n = len(self.sess(call.from_user.id).get("sel", set()))
             kb.row(B(f"👁 Предпросмотр ({n})", callback_data=self.cb("trp", tid, sid)))
-        return "Выберите категорию:", self.nav(kb, self.cb("trs", tid, sid))
+        hint = f"\n🎯 — категории под платформу шаблона ({plat[0]})." if plat else ""
+        return "Выберите категорию услуг поставщика:" + hint, self.nav(kb, self.cb("trs", tid, sid))
+
+    def r_trrec(self, call: CallbackQuery, tid: str, sid: str, idx: str, page: str = "0") -> tuple:
+        cats = self.p.sup.categories(int(sid))
+        picks = self.p.ml.recommend(int(sid), cats[int(idx)], int(tid))
+        if not picks:
+            self.toast(call, "В категории нет подходящих услуг", True)
+            return self.r_trm(call, tid, sid, "rec", "0")
+        self.sess(call.from_user.id)["run"] = {"tid": int(tid), "sid": int(sid), "mode": "sel",
+                                               "arg": [p["service_id"] for p in picks],
+                                               "why": {p["service_id"]: p["why"] for p in picks}}
+        return self.scr_run_preview(call.from_user.id)
 
     def r_trc(self, call: CallbackQuery, tid: str, sid: str, idx: str, page: str = "0") -> tuple:
         cats = self.p.sup.categories(int(sid))
@@ -4438,17 +5345,60 @@ class TelegramUI:
         run = self.sess(uid).get("run")
         services = self.p.ml.select_services(run["sid"], run["mode"], run["arg"])
         run["services"] = [s["service_id"] for s in services]
-        text = self.p.ml.preview(run["tid"], run["sid"], services)
-        kb = K().row(B(f"🚀 Опубликовать ({len(services)} усл.)", callback_data=self.cb("trgo")))
+        margin = D(run["margin"]) if run.get("margin") is not None else None
+        text = self.p.ml.preview(run["tid"], run["sid"], services, margin=margin)
+        if run.get("why"):
+            text += "\n\n<b>⭐ Почему выбраны:</b>\n" + "\n".join(
+                f"• {esc(k)}: {esc(v)}" for k, v in run["why"].items())
+        presets = self.p.cfg.get("masterlot.margin_presets") or [15, 20, 25, 30, 40, 50]
+        kb = K()
+        row = []
+        for m in presets:
+            mark = "✅" if margin is not None and D(m) == margin else ""
+            row.append(B(f"{mark}{m}%", callback_data=self.cb("trmg", m)))
+            if len(row) == 3:
+                kb.row(*row)
+                row = []
+        if row:
+            kb.row(*row)
+        kb.row(B("✏️ Своя наценка", callback_data=self.cb("trmgc")),
+               B(("✅ " if margin is None else "") + "По умолчанию", callback_data=self.cb("trmg", "-")))
+        kb.row(B(f"🚀 Опубликовать ({len(services)} усл.)", callback_data=self.cb("trgo")))
+        text += ("\n\n💰 <b>Наценка</b> — сколько вы зарабатываете сверх цены сайта. 25% = при себестоимости "
+                 "100 ₽ чистыми останется ~25 ₽ после комиссий.")
         return text, self.nav(kb, self.cb("trs", run["tid"], run["sid"]))
+
+    def r_trmg(self, call: CallbackQuery, value: str) -> tuple:
+        run = self.sess(call.from_user.id).get("run")
+        if not run:
+            return self.r_ml(call)
+        run["margin"] = None if value == "-" else str(D(value))
+        return self.scr_run_preview(call.from_user.id)
+
+    def r_trmgc(self, call: CallbackQuery, *args: str) -> None:
+        self.ask(call, call.from_user.id, "Наценка в % (например 25 или 37.5):", "run_margin", {},
+                 self.cb("trmgback"))
+
+    def r_trmgback(self, call: CallbackQuery, *args: str) -> tuple:
+        if not self.sess(call.from_user.id).get("run"):
+            return self.r_ml(call)
+        return self.scr_run_preview(call.from_user.id)
+
+    def i_run_margin(self, target: tuple, uid: int, text: str, data: dict) -> tuple:
+        run = self.sess(uid).get("run")
+        if not run:
+            return self.r_ml(None)
+        run["margin"] = str(D(Config.coerce("pct", text)))
+        return self.scr_run_preview(uid)
 
     def r_trgo(self, call: CallbackQuery, *args: str) -> tuple:
         run = self.sess(call.from_user.id).get("run")
         if not run:
             return self.r_ml(call)
         kb = K().row(B("✅ Да, запустить", callback_data=self.cb("trgoy")),
-                     B("Отмена", callback_data=self.cb("t", run["tid"])))
-        return (f"Запустить публикацию для {len(run.get('services', []))} услуг?"
+                     B("Отмена", callback_data=self.cb("trmgback")))
+        margin = f"{run['margin']}%" if run.get("margin") is not None else "по умолчанию"
+        return (f"Запустить публикацию для {len(run.get('services', []))} услуг с наценкой {margin}?"
                 f"{' (dry-run)' if self.p.dry else ''}", kb)
 
     def r_trgoy(self, call: CallbackQuery, *args: str) -> None:
@@ -4467,9 +5417,11 @@ class TelegramUI:
                               f"пропущено {rep['skipped']}, ошибок {len(rep['errors'])}")
 
         def work() -> tuple:
-            rep = self.p.ml.run(run["tid"], run["sid"], services, progress)
+            margin = D(run["margin"]) if run.get("margin") is not None else None
+            rep = self.p.ml.run(run["tid"], run["sid"], services, progress, margin)
             text = (f"<b>Итог публикации</b>\nВсего: {rep['total']}\nСоздано: {rep['created']}\n"
-                    f"Обновлено: {rep['updated']}\nПропущено: {rep['skipped']}\nОшибок: {len(rep['errors'])}")
+                    f"Обновлено: {rep['updated']}\nПропущено: {rep['skipped']}\n"
+                    f"Ошибки и пропуски с причиной: {len(rep['errors'])}")
             if rep["errors"]:
                 text += "\n" + "\n".join(f"• {esc(e)}" for e in rep["errors"][:15])
             if rep["unknown"]:
@@ -4485,12 +5437,13 @@ class TelegramUI:
         kb = K()
 
         def btn(l: dict) -> B:
-            mark = "❓" if l["lost"] else ("✋" if l["manual_edit"] else ("🟢" if l["enabled"] else "⚪"))
+            mark = "❓" if l["lost"] else ("⏸" if l["auto_paused"] else ("✋" if l["manual_edit"] else
+                                                                          ("🟢" if l["enabled"] else "⚪")))
             return B(f"{mark} #{l['id']} {(l['title'] or '')[:36]} | {l['price'] or '?'}₽",
                      callback_data=self.cb("l", l["id"]))
 
         self.paginate(kb, lots, int(page), btn, lambda pg: self.cb("lots", pg))
-        return (f"<b>📋 Лоты плагина</b>: {len(lots)}\n🟢 активен ⚪ выключен ✋ ручные правки ❓ потерян",
+        return (f"<b>📋 Лоты плагина</b>: {len(lots)}\n🟢 активен ⚪ выключен ⏸ автопауза ✋ ручные правки ❓ потерян",
                 self.nav(kb, self.cb("ml")))
 
     def scr_lot(self, lid: int, notice: str = "") -> tuple[str, K]:
@@ -4513,7 +5466,8 @@ class TelegramUI:
                 f"Текущая цена на FP: {lot['price'] or '—'} ₽\n"
                 f"Состояние: {'потерян ❓' if lot['lost'] else ('вкл' if lot['enabled'] else 'выкл')}"
                 f"{' | ✋ ручные правки' if lot['manual_edit'] else ''}"
-                f"{' | 🏷 умная скидка' if lot['discount_active'] else ''}\n"
+                f"{' | 🏷 умная скидка' if lot['discount_active'] else ''}"
+                f"{' | ⏸ автопауза: ' + ('нет баланса' if lot['auto_paused'] == 'balance' else 'нет услуги') if lot['auto_paused'] else ''}\n"
                 f"Кандидатов: {len(cands)}")
         if calc:
             text += (f"\nРасчётная цена: <b>{money(calc['price'])} ₽</b>, себестоимость {money(calc['cost'])} ₽, "
@@ -4677,7 +5631,7 @@ class TelegramUI:
         return f"<b>{title}</b>: {len(rows)}", self.nav(kb, self.cb("o"))
 
     def r_oa(self, call: CallbackQuery, page: str = "0") -> tuple:
-        rows = self.p.db.query(f"SELECT * FROM orders WHERE status IN ({','.join('?' * 5)}) ORDER BY id DESC",
+        rows = self.p.db.query(f"SELECT * FROM orders WHERE status IN ({','.join('?' * len(ACTIVE_ORDER_STATUSES))}) ORDER BY id DESC",
                                ACTIVE_ORDER_STATUSES)
         return self.order_list(rows, int(page), "oa", "⏳ Активные заказы")
 
@@ -4734,6 +5688,9 @@ class TelegramUI:
                B("🔗 Запросить ссылку", callback_data=self.cb("oact", oid, "relink")))
         if o["status"] == ORDER_PARTIAL or o["remain"]:
             kb.row(B("🔁 Дозаказать остаток", callback_data=self.cb("oact", oid, "reorder")))
+        if o["status"] == ORDER_UNCERTAIN:
+            kb.row(B("✅ Заказ создан — ввести ID", callback_data=self.cb("ounc", oid)),
+                   B("🔁 Не создан — отправить", callback_data=self.cb("oact", oid, "resend")))
         if o["problem"]:
             kb.row(B("🧹 Снять «проблемный»", callback_data=self.cb("oact", oid, "unproblem")))
         kb.row(B("⛔ Покупателя в ЧС", callback_data=self.cb("blo", oid)),
@@ -4745,6 +5702,14 @@ class TelegramUI:
 
     def r_oact(self, call: CallbackQuery, oid: str, action: str) -> None:
         self.bg(call, lambda: self.scr_order(int(oid), self.p.orders.manual(int(oid), action)))
+
+    def r_ounc(self, call: CallbackQuery, oid: str) -> None:
+        self.ask(call, call.from_user.id, "Номер заказа у поставщика (из его кабинета) — плагин продолжит "
+                                          "отслеживать выполнение без повторной отправки:", "ounc",
+                 {"oid": int(oid)}, self.cb("od", oid))
+
+    def i_ounc(self, target: tuple, uid: int, text: str, data: dict) -> tuple:
+        return self.scr_order(data["oid"], self.p.orders.manual(data["oid"], "set_sent", text.strip()))
 
     def r_oref(self, call: CallbackQuery, oid: str) -> tuple:
         o = self.p.orders.get(int(oid))
@@ -5450,6 +6415,136 @@ class Alerts:
                 log_error(f"Не удалось отправить алерт админу {admin}", exc=True)
 
 
+class AutoPilot:
+    """Автоматизация без участия продавца: пауза/включение лотов, запасные поставщики, автобэкап."""
+
+    def __init__(self, p: "AutoSMM"):
+        self.p = p
+        self.force = threading.Event()
+        self.last_guard = 0.0
+
+    def on_no_balance(self, sid: int) -> None:
+        row = self.p.sup.row(sid)
+        self.p.alerts.send(f"💰 <b>{esc(row['name'] if row else sid)}</b>: не хватает баланса для заказа. "
+                           f"Пополните баланс — лоты, которые нечем выполнить, встанут на паузу и включатся сами "
+                           f"после пополнения.", key=f"nobal:{sid}", cooldown=1800)
+        self.force.set()
+
+    def lot_state(self, lot: dict) -> Optional[str]:
+        """None — лот можно продавать; 'balance' — у всех поставщиков мало денег; 'service' — нет доступных услуг."""
+        unit = self.p.price.lot_unit(lot)
+        has_service = False
+        for c in self.p.price.lot_candidates(lot["id"]):
+            if not (int(c["min"] or 1) <= unit <= int(c["max"] or 10 ** 9)):
+                continue
+            s = self.p.sup.get(c["supplier_id"])
+            if not s or not s.api_key:
+                continue
+            has_service = True
+            bal, _cur = self.p.sup.balance(c["supplier_id"], max_age=600)
+            if bal is None:
+                return None
+            if bal >= D(c["rate"]) * D(unit) / D(s.rate_unit):
+                return None
+        return "balance" if has_service else "service"
+
+    def guard_lots(self) -> dict:
+        """Ставит на паузу лоты, которые нечем выполнить, и включает обратно, когда проблема ушла."""
+        res = {"paused": 0, "resumed": 0, "balance": 0, "service": 0}
+        want_balance = self.p.cfg.get("auto.pause_lots_low_balance")
+        want_service = self.p.cfg.get("auto.pause_lots_missing_service")
+        lots = self.p.db.query("SELECT * FROM lots WHERE enabled=1 AND lost=0 AND fp_lot_id IS NOT NULL")
+        for lot in lots:
+            if self.p.stop.is_set():
+                break
+            try:
+                state = self.lot_state(lot)
+            except Exception:
+                log_error(f"AutoPilot: лот {lot['id']}", exc=True)
+                continue
+            if state == "balance" and not want_balance or state == "service" and not want_service:
+                state = None
+            if state and not lot["auto_paused"]:
+                if self._set_active(lot, False):
+                    self.p.db.execute("UPDATE lots SET auto_paused=? WHERE id=?", (state, lot["id"]))
+                    res["paused"] += 1
+                    res[state] += 1
+            elif not state and lot["auto_paused"]:
+                if self._set_active(lot, True):
+                    self.p.db.execute("UPDATE lots SET auto_paused=NULL WHERE id=?", (lot["id"],))
+                    res["resumed"] += 1
+        if res["paused"]:
+            self.p.alerts.send(f"⏸ Автопауза лотов: {res['paused']} (нет баланса: {res['balance']}, нет услуги: "
+                               f"{res['service']}). Они включатся автоматически, когда проблема исчезнет.",
+                               key="autopause", cooldown=1800)
+        if res["resumed"]:
+            self.p.alerts.send(f"▶️ Лоты снова активны: {res['resumed']}.", key="autoresume", cooldown=600)
+        return res
+
+    def _set_active(self, lot: dict, active: bool) -> bool:
+        if self.p.dry:
+            log_info(f"[DRY-RUN] Лот FP {lot['fp_lot_id']}: {'включить' if active else 'пауза'}")
+            return True
+        try:
+            self.p.ml.fp_update(int(lot["fp_lot_id"]), {"active": active})
+            time.sleep(float(self.p.cfg.get("fp_pause")))
+            log_info(f"Лот FP {lot['fp_lot_id']}: {'включён' if active else 'автопауза'}")
+            return True
+        except Exception as e:
+            log_error(f"Не удалось {'включить' if active else 'выключить'} лот {lot['fp_lot_id']}: {e}")
+            return False
+
+    def attach_alternatives(self, lot: dict, limit: int = 2) -> int:
+        """Добавляет лоту запасных поставщиков с похожей услугой (та же платформа, схожее название)."""
+        min_score = float(self.p.cfg.get("auto.alt_min_score"))
+        unit = self.p.price.lot_unit(lot)
+        bound = self.p.price.lot_candidates(lot["id"], usable_only=False)
+        have_suppliers = {b["supplier_id"] for b in bound}
+        added = 0
+        for s in self.p.cat.suggest(lot, limit=30):
+            if added >= limit:
+                break
+            if s["score"] < min_score or s["supplier_id"] in have_suppliers:
+                continue
+            if not (int(s["min"] or 1) <= unit <= int(s["max"] or 10 ** 9)):
+                continue
+            base = bound[0] if bound else None
+            if base and to_bool(base.get("refill")) and not to_bool(s.get("refill")):
+                continue
+            self.p.ml._ensure_candidate(lot["id"], s["supplier_id"], s["service_id"])
+            have_suppliers.add(s["supplier_id"])
+            added += 1
+        return added
+
+    def alternatives_pass(self) -> int:
+        if not self.p.cfg.get("auto.auto_alternatives") or len(self.p.sup.list(enabled_only=True)) < 2:
+            return 0
+        total = 0
+        for lot in self.p.db.query("SELECT * FROM lots WHERE enabled=1 AND lost=0"):
+            if len(self.p.price.lot_candidates(lot["id"], usable_only=False)) < 2:
+                total += self.attach_alternatives(lot)
+        if total:
+            self.p.alerts.send(f"🧩 Автоподбор: добавлено запасных поставщиков — {total}. При отказе основного "
+                               f"заказ уйдёт запасному автоматически.", key="alts", cooldown=3600)
+        return total
+
+    def step(self) -> int:
+        """Проход автопилота; возвращает паузу до следующего (с)."""
+        now = time.time()
+        if self.force.is_set() or now - self.last_guard > 600:
+            self.force.clear()
+            self.last_guard = now
+            self.guard_lots()
+        if now - float(self.p.db.meta_get("auto_alts_ts", 0)) > 6 * 3600:
+            self.p.db.meta_set("auto_alts_ts", int(now))
+            self.alternatives_pass()
+        today = datetime.now().strftime("%Y-%m-%d")
+        if self.p.cfg.get("auto.daily_backup") and self.p.db.meta_get("auto_backup_day") != today:
+            self.p.db.meta_set("auto_backup_day", today)
+            self.p.db.backup("daily")
+        return 60 if not self.force.is_set() else 5
+
+
 class Reports:
     """Отчёты, дайджест, проверки балансов, диагностика."""
 
@@ -5577,7 +6672,8 @@ class Reports:
                 state = f"ошибка: {esc(e.message)}"
             br = " ⛔ breaker" if inst.breaker.is_open else ""
             lines.append(f"{'🟢' if s['enabled'] else '🔴'} {esc(s['name'])}: {state}{br}")
-        counts = p.db.query("SELECT status, COUNT(*) AS cnt FROM orders WHERE status IN (?,?,?,?,?) GROUP BY status",
+        counts = p.db.query(f"SELECT status, COUNT(*) AS cnt FROM orders WHERE status IN "
+                            f"({','.join('?' * len(ACTIVE_ORDER_STATUSES))}) GROUP BY status",
                             ACTIVE_ORDER_STATUSES)
         lines.append("\n<b>Очередь заказов:</b> " + (", ".join(f"{r['status']}={r['cnt']}" for r in counts) or "пусто"))
         nxt = p.db.scalar("SELECT MIN(next_at) FROM raise_state", ())
@@ -5640,6 +6736,7 @@ class AutoSMM:
         self.sync = SyncManager(self)
         self.tr = Transfer(self)
         self.rep = Reports(self)
+        self.auto = AutoPilot(self)
         self.ui = TelegramUI(self)
         self._ensure_default_supplier()
 
@@ -5689,7 +6786,8 @@ class AutoSMM:
         self.started = True
         self.orders.restore()
         for name, fn in (("asm-orders", self._orders_step), ("asm-prices", self._prices_step),
-                         ("asm-raise", self.raiser.step), ("asm-reports", self.rep.step)):
+                         ("asm-raise", self.raiser.step), ("asm-reports", self.rep.step),
+                         ("asm-autopilot", self.auto.step)):
             t = threading.Thread(target=self._loop, args=(name, fn), daemon=True, name=name)
             t.start()
             self.threads.append(t)
