@@ -45,7 +45,7 @@ if TYPE_CHECKING:
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
 
 NAME = "AutoSMMway"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 DESCRIPTION = ("Универсальная перепродажа SMM-услуг: любые поставщики через профили, мастер-лоты, "
                "автозаказы, мульти-поставщик, автоподнятие, перенос лотов.")
 CREDITS = "@autosmmway"
@@ -4628,13 +4628,15 @@ class TelegramUI:
     def cmd_menu(self, m: Message) -> None:
         if not self.is_admin(m.from_user.id):
             return
-        text, kb = self.scr_main()
+        text, kb = self.scr_main(m.from_user.id)
         self.show(m.chat.id, text, kb)
 
     def open_from_settings(self, call: CallbackQuery) -> None:
         if not self.is_admin(call.from_user.id):
             return self.toast(call, "Нет доступа", True)
-        text, kb = self.scr_main()
+        parts = call.data.split(":")
+        self.sess(call.from_user.id)["plugins_offset"] = parts[2] if len(parts) > 2 and parts[2].isdigit() else "0"
+        text, kb = self.scr_main(call.from_user.id)
         self.show(call, text, kb)
         self.toast(call)
 
@@ -4720,14 +4722,28 @@ class TelegramUI:
                 if isinstance(res, tuple):
                     return res
                 return None
-        return self.scr_main()
+        return self.scr_main(call.from_user.id)
 
     def order_kb(self, oid: int) -> K:
         return K().row(B("🧾 Открыть заказ", callback_data=self.cb("od", oid)))
 
     # ── главное меню ──
-    def scr_main(self) -> tuple[str, K]:
+    def setup_steps(self) -> list[tuple[str, bool, str]]:
+        """Шаги быстрой настройки: (название, выполнен, callback)."""
         p = self.p
+        has_sup = any(not s["needs_key"] for s in p.sup.list(enabled_only=True))
+        lots = int(p.db.scalar("SELECT COUNT(*) FROM lots WHERE fp_lot_id IS NOT NULL AND lost=0", (), 0))
+        return [
+            ("Подключить сайт-поставщика", has_sup, self.cb("go1")),
+            ("Выбрать наценку", bool(p.db.meta_get("setup_margin")), self.cb("go2")),
+            ("Выставить лоты", lots > 0, self.cb("go3")),
+            ("Включить боевой режим", not p.dry, self.cb("go4")),
+        ]
+
+    def scr_main(self, uid: Optional[int] = None) -> tuple[str, K]:
+        p = self.p
+        steps = self.setup_steps()
+        done = sum(1 for s in steps if s[1])
         active = p.db.scalar(f"SELECT COUNT(*) FROM orders WHERE status IN ({','.join('?' * len(ACTIVE_ORDER_STATUSES))})",
                              ACTIVE_ORDER_STATUSES, 0)
         problems = p.db.scalar("SELECT COUNT(*) FROM orders WHERE problem=1 AND status NOT IN ('CLOSED','REFUNDED')",
@@ -4737,20 +4753,187 @@ class TelegramUI:
         paused = p.db.scalar("SELECT COUNT(*) FROM lots WHERE auto_paused IS NOT NULL", (), 0)
         if paused:
             dry_line += f"⏸ На автопаузе лотов: {paused} — пополните баланс поставщика, включатся сами\n"
-        text = (f"<b>🤖 AutoSMMway v{VERSION}</b>\n{dry_line}"
-                f"Поставщиков: {len(p.sup.list(True))} | Лотов: {lots}\n"
-                f"Активных заказов: {active} | Проблемных: {problems}")
+        if p.dry:
+            dry_line = dry_line.replace("🧪 <b>DRY-RUN</b>: ничего не отправляется в FP и поставщикам",
+                                        "🧪 <b>Тестовый режим</b>: заказы и лоты не отправляются по-настоящему")
+        setup = "" if done == len(steps) else \
+            f"⚙️ Настройка: {done}/{len(steps)} — нажмите «🚀 Быстрая настройка»\n"
+        text = (f"<b>🤖 AutoSMMway v{VERSION}</b>\n{setup}{dry_line}"
+                f"Лотов: {lots} | заказов в работе: {active}" + (f" | ⚠️ проблемных: {problems}" if problems else ""))
         kb = K()
-        kb.row(B("💰 Баланс и статистика", callback_data=self.cb("bal")), B("📦 Каталог", callback_data=self.cb("cat")))
-        kb.row(B("🏷 Мастер-лоты", callback_data=self.cb("ml")), B("🧾 Заказы", callback_data=self.cb("o")))
-        kb.row(B("🔄 Поднятие", callback_data=self.cb("r")), B("🔌 Поставщики", callback_data=self.cb("s")))
-        kb.row(B("📦 Перенос лотов", callback_data=self.cb("tf")), B("⚙️ Настройки", callback_data=self.cb("st")))
-        kb.row(B("📊 Отчёты", callback_data=self.cb("rep")), B("🛠 Диагностика", callback_data=self.cb("dg")))
+        if done < len(steps):
+            kb.row(B("🚀 Быстрая настройка", callback_data=self.cb("go")))
+        kb.row(B("🏷 Выставить лоты", callback_data=self.cb("ml")), B("🧾 Заказы", callback_data=self.cb("o")))
+        kb.row(B("🔌 Сайты-поставщики", callback_data=self.cb("s")), B("💰 Баланс и прибыль", callback_data=self.cb("bal")))
+        kb.row(B("⚙️ Настройки", callback_data=self.cb("st")), B("➕ Ещё", callback_data=self.cb("more")))
+        offset = self.sess(uid).get("plugins_offset", "0") if uid else "0"
+        kb.row(B("◀️ К плагинам", callback_data=f"{CBT.EDIT_PLUGIN}:{UUID}:{offset}"))
         return text, kb
+
+    def r_more(self, call: CallbackQuery, *args: str) -> tuple:
+        kb = K()
+        kb.row(B("📦 Каталог услуг", callback_data=self.cb("cat")), B("🔄 Автоподнятие", callback_data=self.cb("r")))
+        kb.row(B("📊 Отчёты", callback_data=self.cb("rep")), B("🛠 Диагностика", callback_data=self.cb("dg")))
+        kb.row(B("📦 Перенос / бэкапы", callback_data=self.cb("tf")),
+               B("🚀 Быстрая настройка", callback_data=self.cb("go")))
+        return ("<b>➕ Ещё</b>\n📦 Каталог — все услуги сайтов с ценами.\n🔄 Автоподнятие лотов на FunPay.\n"
+                "📊 Отчёты — прибыль за день/неделю/месяц.\n🛠 Диагностика — проверить, что всё работает.\n"
+                "📦 Перенос — экспорт/импорт и бэкапы (нужно при переезде)."), self.nav(kb, self.cb("m"))
+
+    # ── быстрая настройка ──
+    def r_go(self, call: CallbackQuery, *args: str) -> tuple:
+        steps = self.setup_steps()
+        lines = ["<b>🚀 Быстрая настройка</b>", "Пройдите шаги по порядку — это займёт пару минут.\n"]
+        kb = K()
+        nxt = None
+        for i, (title, ok, cbd) in enumerate(steps, 1):
+            lines.append(f"{'✅' if ok else '⬜'} {i}. {title}")
+            if not ok and nxt is None:
+                nxt = (i, title, cbd)
+            kb.row(B(f"{'✅' if ok else '⬜'} {i}. {title}", callback_data=cbd))
+        if nxt:
+            lines.append(f"\n➡️ Следующий шаг: <b>{nxt[1]}</b>")
+        else:
+            lines.append("\n🎉 Всё готово! Плагин сам принимает заказы, отправляет их поставщику, следит за ценами "
+                         "и возвращает деньги, если что-то пошло не так. Вам остаётся пополнять баланс сайта.")
+        return "\n".join(lines), self.nav(kb, self.cb("m"))
+
+    def r_go1(self, call: CallbackQuery, *args: str) -> tuple:
+        kb = K()
+        kb.row(B("⭐ SMMway — нужен только ключ", callback_data=self.cb("qa", "smmway")))
+        kb.row(B("🌐 Другая SMM-панель (ссылка + ключ)", callback_data=self.cb("qa", "smm_v2")))
+        kb.row(B("🛠 Свой API — ручная настройка", callback_data=self.cb("sa")))
+        return ("<b>Шаг 1. Подключить сайт</b>\nОткуда брать услуги? Большинство SMM-панелей работают по одному "
+                "стандарту — достаточно адреса API и ключа из личного кабинета сайта (раздел «API»)."), \
+            self.nav(kb, self.cb("go"))
+
+    def r_qa(self, call: CallbackQuery, preset: str) -> None:
+        self.sess(call.from_user.id)["qa"] = {"preset": preset}
+        if preset == "smmway":
+            url = PRESETS["smmway"]["profile"]["base_url"]
+            self.ask(call, call.from_user.id, f"Пришлите <b>API-ключ SMMway</b> (личный кабинет → API).\n"
+                                              f"Сообщение с ключом сразу удалится из чата.\n\n"
+                                              f"Адрес API: <code>{esc(url)}</code> — если у сайта другой, поменяете "
+                                              f"потом в «Сайты-поставщики».", "qa_key", {}, self.cb("go1"))
+            return
+        self.ask(call, call.from_user.id, "Пришлите <b>адрес API</b> панели — он есть на странице «API» сайта, "
+                                          "обычно вида <code>https://сайт.com/api/v2</code>:", "qa_url", {},
+                 self.cb("go1"))
+
+    def i_qa_url(self, target: tuple, uid: int, text: str, data: dict) -> None:
+        url = text.strip().rstrip("/")
+        if not re.match(r"^https?://\S+\.\S+", url):
+            self.ask(target, uid, "❗ Это не похоже на адрес. Пример: <code>https://site.com/api/v2</code>. "
+                                  "Попробуйте ещё раз:", "qa_url", {}, self.cb("go1"))
+            return None
+        if not re.search(r"/api", url):
+            url += "/api/v2"
+        self.sess(uid).setdefault("qa", {})["url"] = url
+        self.ask(target, uid, f"Адрес: <code>{esc(url)}</code>\nТеперь пришлите <b>API-ключ</b> (сообщение удалится):",
+                 "qa_key", {}, self.cb("go1"))
+        return None
+
+    def i_qa_key(self, target: tuple, uid: int, text: str, data: dict) -> None:
+        qa = self.sess(uid).get("qa") or {"preset": "smmway"}
+        qa["key"] = text.strip()
+
+        def work() -> tuple:
+            preset = qa["preset"]
+            profile = json.loads(json.dumps(PRESETS[preset]["profile"]))
+            if qa.get("url"):
+                profile["base_url"] = qa["url"]
+                host = re.sub(r"^https?://(www\.)?", "", qa["url"]).split("/")[0]
+                profile["name"] = host
+            s = SupplierBase.create_from_profile(profile, qa["key"], 0, lambda: True)
+            try:
+                bal, cur = s.get_balance()
+                if cur in ("USD", "RUB", "EUR"):
+                    profile["currency"] = cur
+            except SupplierError as e:
+                kb = K().row(B("🔑 Ввести ключ ещё раз", callback_data=self.cb("qa", preset)))
+                kb.row(B("🛠 Ручная настройка", callback_data=self.cb("sa")))
+                hint = "Ключ не подошёл." if e.code == "auth" else f"Сайт ответил ошибкой: {esc(e.message)}."
+                raw = f"\n<code>{esc(s.last_raw[:300])}</code>" if s.last_raw else ""
+                return f"❌ {hint}{raw}\nПроверьте ключ и адрес API.", self.nav(kb, self.cb("go"))
+            existing = [r for r in self.p.sup.list() if r["preset"] == preset and r["needs_key"]]
+            if existing:
+                sid = existing[0]["id"]
+                self.p.sup.update_profile(sid, dict(self.p.sup.profile(sid), currency=profile["currency"],
+                                                    base_url=profile["base_url"]))
+                self.p.sup.set_key(sid, qa["key"])
+                self.p.sup.set_field(sid, "enabled", 1)
+            else:
+                sid = self.p.sup.add(profile, qa["key"], enabled=True)
+            try:
+                n = self.p.sup.refresh_catalog(sid, force=True)
+            except SupplierError as e:
+                n = 0
+                log_warn(f"Каталог: {e.message}")
+            self.sess(uid).pop("qa", None)
+            text_, kb = self.r_go(None)
+            return (f"✅ <b>Сайт подключён!</b> Баланс: {money(bal)} {esc(cur)}, услуг: {n}.\n\n" + text_), kb
+
+        self.bg(target, work, "⏳ Проверяю подключение…")
+        return None
+
+    def r_go2(self, call: CallbackQuery, *args: str) -> tuple:
+        cur = self.p.cfg.get("margin_default")
+        kb = K()
+        row = []
+        for m in (15, 20, 25, 30, 40, 50):
+            row.append(B(("✅" if float(cur) == m else "") + f"{m}%", callback_data=self.cb("go2s", m)))
+            if len(row) == 3:
+                kb.row(*row)
+                row = []
+        kb.row(B("✏️ Своя", callback_data=self.cb("go2c")))
+        example = Decimal("100") * (1 + D(cur) / 100)
+        return ("<b>Шаг 2. Наценка</b>\nСколько вы зарабатываете сверх цены сайта.\n"
+                f"Сейчас: <b>{cur}%</b> — услуга за 100 ₽ продаётся примерно за {money(example)} ₽ "
+                f"(+ комиссии, если заданы).\n\n💡 Новичкам: 25-30%. Цены лотов пересчитываются сами, если сайт "
+                f"поменяет свою цену."), self.nav(kb, self.cb("go"))
+
+    def r_go2s(self, call: CallbackQuery, value: str) -> tuple:
+        self.p.cfg.set("margin_default", float(value))
+        self.p.db.meta_set("setup_margin", 1)
+        text, kb = self.r_go(call)
+        return f"✅ Наценка {value}% сохранена.\n\n" + text, kb
+
+    def r_go2c(self, call: CallbackQuery, *args: str) -> None:
+        self.ask(call, call.from_user.id, "Наценка в % (например 27):", "go2c", {}, self.cb("go2"))
+
+    def i_go2c(self, target: tuple, uid: int, text: str, data: dict) -> tuple:
+        value = float(Config.coerce("pct", text))
+        return self.r_go2s(None, str(value))
+
+    def r_go3(self, call: CallbackQuery, *args: str) -> tuple:
+        if not any(not s["needs_key"] for s in self.p.sup.list(enabled_only=True)):
+            return "Сначала подключите сайт (шаг 1).", self.nav(K().row(B("1. Подключить сайт",
+                                                                          callback_data=self.cb("go1"))), self.cb("go"))
+        text, kb = self.r_tg(call)
+        return ("<b>Шаг 3. Выставить лоты</b>\nВыберите, что будете продавать — плагин подставит готовый текст, "
+                "найдёт категорию FunPay и подберёт лучшие услуги.\n\n" + text.split("\n", 1)[1]), kb
+
+    def r_go4(self, call: CallbackQuery, *args: str) -> tuple:
+        kb = K()
+        if self.p.dry:
+            kb.row(B("✅ Включить боевой режим", callback_data=self.cb("go4s", 0)))
+        else:
+            kb.row(B("🧪 Вернуть тестовый режим", callback_data=self.cb("go4s", 1)))
+        return ("<b>Шаг 4. Боевой режим</b>\n"
+                f"Сейчас: <b>{'🧪 тестовый' if self.p.dry else '✅ боевой'}</b>.\n\n"
+                "🧪 В тестовом режиме плагин всё делает «понарошку»: лоты не выставляются, заказы поставщику не "
+                "уходят, покупателям ничего не пишется — только записи в лог.\n"
+                "✅ В боевом режиме всё работает по-настоящему. Перед включением пополните баланс сайта."), \
+            self.nav(kb, self.cb("go"))
+
+    def r_go4s(self, call: CallbackQuery, dry: str) -> tuple:
+        self.p.cfg.set("dry_run", bool(int(dry)))
+        text, kb = self.r_go(call)
+        return ("🧪 Тестовый режим включён.\n\n" if int(dry) else "✅ Боевой режим включён!\n\n") + text, kb
 
     def r_m(self, call: CallbackQuery, *args: str) -> tuple:
         self.tg.clear_state(call.message.chat.id, call.from_user.id)
-        return self.scr_main()
+        return self.scr_main(call.from_user.id)
 
     def r_bal(self, call: CallbackQuery, *args: str) -> None:
         def work() -> tuple[str, K]:
@@ -5788,11 +5971,12 @@ class TelegramUI:
         for s in self.p.sup.list():
             mark = "🔑" if s["needs_key"] else ("🟢" if s["enabled"] else "🔴")
             kb.row(B(f"{mark} {s['name']} (приоритет {s['priority']})", callback_data=self.cb("sp", s["id"])))
-        kb.row(B("➕ Добавить сайт", callback_data=self.cb("sa")),
-               B("📥 Импорт профиля", callback_data=self.cb("simp")))
-        kb.row(B(f"🎯 Режим выбора: {self.p.cfg.get('select_mode_default')}", callback_data=self.cb("smode")))
-        return ("<b>🔌 Поставщики</b>\n🟢 включён 🔴 выключен 🔑 нужен ключ\n"
-                "Любая SMM-панель API v2 или REST API настраивается профилем."), self.nav(kb, self.cb("m"))
+        kb.row(B("➕ Подключить сайт", callback_data=self.cb("go1")))
+        kb.row(B("📥 Импорт профиля", callback_data=self.cb("simp")),
+               B(f"🎯 Выбор: {self.p.cfg.get('select_mode_default')}", callback_data=self.cb("smode")))
+        return ("<b>🔌 Сайты-поставщики</b>\n🟢 работает 🔴 выключен 🔑 нужен ключ — нажмите, чтобы ввести.\n\n"
+                "Подключите 2 сайта — если один не сможет выполнить заказ, плагин сам отправит его другому."), \
+            self.nav(kb, self.cb("m"))
 
     def r_smode(self, call: CallbackQuery, *args: str) -> tuple:
         kb = K()
@@ -6273,14 +6457,42 @@ class TelegramUI:
         return "✅ База восстановлена.", self.nav(K(), self.cb("tfb"))
 
     # ── настройки ──
+    SIMPLE_TOGGLES = [
+        ("auto.refund_on_fail", "Автовозврат, если заказ не выполнить"),
+        ("auto.pause_lots_low_balance", "Пауза лотов, когда кончился баланс"),
+        ("raise.enabled", "Автоподнятие лотов"),
+        ("auto.refill_requests", "Автодокрутка по просьбе покупателя"),
+        ("auto.notify_new_orders", "Уведомлять о каждом заказе"),
+    ]
+
     def r_st(self, call: CallbackQuery, *args: str) -> tuple:
+        cfg = self.p.cfg
+        kb = K()
+        kb.row(B(f"Режим: {'🧪 тестовый' if self.p.dry else '✅ боевой'}", callback_data=self.cb("go4")))
+        kb.row(B(f"Наценка: {cfg.get('margin_default')}%", callback_data=self.cb("go2")))
+        for i, (key, title) in enumerate(self.SIMPLE_TOGGLES):
+            kb.row(B(f"{'✅' if cfg.get(key) else '⬜'} {title}", callback_data=self.cb("sts", i)))
+        kb.row(B("✉️ Тексты сообщений покупателям", callback_data=self.cb("stmsg")))
+        kb.row(B("🔧 Все настройки (для опытных)", callback_data=self.cb("sta")))
+        return ("<b>⚙️ Настройки</b>\nГлавное — здесь. Нажмите на пункт, чтобы включить ✅ или выключить ⬜.\n"
+                "Остальное уже настроено по умолчанию."), self.nav(kb, self.cb("m"))
+
+    def r_sts(self, call: CallbackQuery, idx: str) -> tuple:
+        key = self.SIMPLE_TOGGLES[int(idx)][0]
+        value = not self.p.cfg.get(key)
+        self.p.cfg.set(key, value)
+        if key == "auto.pause_lots_low_balance":
+            self.p.cfg.set("auto.pause_lots_missing_service", value)
+        return self.r_st(call)
+
+    def r_sta(self, call: CallbackQuery, *args: str) -> tuple:
         kb = K()
         groups = list(SETTINGS_GROUPS.items())
         for i in range(0, len(groups), 2):
             kb.row(*[B(title, callback_data=self.cb("stg", g)) for g, title in groups[i:i + 2]])
         kb.row(B("✉️ Тексты сообщений", callback_data=self.cb("stmsg")))
-        return ("<b>⚙️ Настройки</b>\nКомиссии не зашиты в код — сверяйте их с актуальными условиями FunPay.",
-                self.nav(kb, self.cb("m")))
+        return ("<b>🔧 Все настройки</b>\nКомиссии не зашиты в код — сверяйте их с актуальными условиями FunPay.",
+                self.nav(kb, self.cb("st")))
 
     @staticmethod
     def fmt_setting(value: Any, typ: str) -> str:
@@ -6298,7 +6510,7 @@ class TelegramUI:
             value = self.fmt_setting(self.p.cfg.get(key), typ)
             act = "stt" if typ == "bool" else "stk"
             kb.row(B(f"{title}: {value}"[:60], callback_data=self.cb(act, idx)))
-        return f"<b>{SETTINGS_GROUPS.get(group, group)}</b>", self.nav(kb, self.cb("st"))
+        return f"<b>{SETTINGS_GROUPS.get(group, group)}</b>", self.nav(kb, self.cb("sta"))
 
     def r_stt(self, call: CallbackQuery, idx: str) -> tuple:
         key, _title, _typ, group = SETTINGS_SCHEMA[int(idx)]
