@@ -45,7 +45,7 @@ if TYPE_CHECKING:
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
 
 NAME = "AutoSMMway"
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 DESCRIPTION = ("Универсальная перепродажа SMM-услуг: любые поставщики через профили, мастер-лоты, "
                "автозаказы, мульти-поставщик, автоподнятие, перенос лотов.")
 CREDITS = "@autosmmway"
@@ -4740,46 +4740,6 @@ class TelegramUI:
             ("Включить боевой режим", not p.dry, self.cb("go4")),
         ]
 
-    def scr_main(self, uid: Optional[int] = None) -> tuple[str, K]:
-        p = self.p
-        steps = self.setup_steps()
-        done = sum(1 for s in steps if s[1])
-        active = p.db.scalar(f"SELECT COUNT(*) FROM orders WHERE status IN ({','.join('?' * len(ACTIVE_ORDER_STATUSES))})",
-                             ACTIVE_ORDER_STATUSES, 0)
-        problems = p.db.scalar("SELECT COUNT(*) FROM orders WHERE problem=1 AND status NOT IN ('CLOSED','REFUNDED')",
-                               (), 0)
-        lots = p.db.scalar("SELECT COUNT(*) FROM lots WHERE fp_lot_id IS NOT NULL AND lost=0", (), 0)
-        dry_line = "🧪 <b>DRY-RUN</b>: ничего не отправляется в FP и поставщикам\n" if p.dry else ""
-        paused = p.db.scalar("SELECT COUNT(*) FROM lots WHERE auto_paused IS NOT NULL", (), 0)
-        if paused:
-            dry_line += f"⏸ На автопаузе лотов: {paused} — пополните баланс поставщика, включатся сами\n"
-        if p.dry:
-            dry_line = dry_line.replace("🧪 <b>DRY-RUN</b>: ничего не отправляется в FP и поставщикам",
-                                        "🧪 <b>Тестовый режим</b>: заказы и лоты не отправляются по-настоящему")
-        setup = "" if done == len(steps) else \
-            f"⚙️ Настройка: {done}/{len(steps)} — нажмите «🚀 Быстрая настройка»\n"
-        text = (f"<b>🤖 AutoSMMway v{VERSION}</b>\n{setup}{dry_line}"
-                f"Лотов: {lots} | заказов в работе: {active}" + (f" | ⚠️ проблемных: {problems}" if problems else ""))
-        kb = K()
-        if done < len(steps):
-            kb.row(B("🚀 Быстрая настройка", callback_data=self.cb("go")))
-        kb.row(B("🏷 Выставить лоты", callback_data=self.cb("ml")), B("🧾 Заказы", callback_data=self.cb("o")))
-        kb.row(B("🔌 Сайты-поставщики", callback_data=self.cb("s")), B("💰 Баланс и прибыль", callback_data=self.cb("bal")))
-        kb.row(B("⚙️ Настройки", callback_data=self.cb("st")), B("➕ Ещё", callback_data=self.cb("more")))
-        offset = self.sess(uid).get("plugins_offset", "0") if uid else "0"
-        kb.row(B("◀️ К плагинам", callback_data=f"{CBT.EDIT_PLUGIN}:{UUID}:{offset}"))
-        return text, kb
-
-    def r_more(self, call: CallbackQuery, *args: str) -> tuple:
-        kb = K()
-        kb.row(B("📦 Каталог услуг", callback_data=self.cb("cat")), B("🔄 Автоподнятие", callback_data=self.cb("r")))
-        kb.row(B("📊 Отчёты", callback_data=self.cb("rep")), B("🛠 Диагностика", callback_data=self.cb("dg")))
-        kb.row(B("📦 Перенос / бэкапы", callback_data=self.cb("tf")),
-               B("🚀 Быстрая настройка", callback_data=self.cb("go")))
-        return ("<b>➕ Ещё</b>\n📦 Каталог — все услуги сайтов с ценами.\n🔄 Автоподнятие лотов на FunPay.\n"
-                "📊 Отчёты — прибыль за день/неделю/месяц.\n🛠 Диагностика — проверить, что всё работает.\n"
-                "📦 Перенос — экспорт/импорт и бэкапы (нужно при переезде)."), self.nav(kb, self.cb("m"))
-
     # ── быстрая настройка ──
     def r_go(self, call: CallbackQuery, *args: str) -> tuple:
         steps = self.setup_steps()
@@ -4909,9 +4869,7 @@ class TelegramUI:
         if not any(not s["needs_key"] for s in self.p.sup.list(enabled_only=True)):
             return "Сначала подключите сайт (шаг 1).", self.nav(K().row(B("1. Подключить сайт",
                                                                           callback_data=self.cb("go1"))), self.cb("go"))
-        text, kb = self.r_tg(call)
-        return ("<b>Шаг 3. Выставить лоты</b>\nВыберите, что будете продавать — плагин подставит готовый текст, "
-                "найдёт категорию FunPay и подберёт лучшие услуги.\n\n" + text.split("\n", 1)[1]), kb
+        return self.r_nl(call)
 
     def r_go4(self, call: CallbackQuery, *args: str) -> tuple:
         kb = K()
@@ -4934,22 +4892,6 @@ class TelegramUI:
     def r_m(self, call: CallbackQuery, *args: str) -> tuple:
         self.tg.clear_state(call.message.chat.id, call.from_user.id)
         return self.scr_main(call.from_user.id)
-
-    def r_bal(self, call: CallbackQuery, *args: str) -> None:
-        def work() -> tuple[str, K]:
-            lines = ["<b>💰 Балансы поставщиков</b>"]
-            for s in self.p.sup.list():
-                if s["needs_key"]:
-                    lines.append(f"🔑 {esc(s['name'])}: нужен ключ")
-                    continue
-                bal, cur = self.p.sup.balance(s["id"], max_age=0)
-                lines.append(f"{'🟢' if s['enabled'] else '🔴'} {esc(s['name'])}: "
-                             f"{money(bal) + ' ' + esc(cur) if bal is not None else 'ошибка'}")
-            lines.append("")
-            lines.append(self.p.rep.period(1, short=True))
-            lines.append(self.p.rep.period(7, short=True))
-            return "\n".join(lines), self.nav(K().row(B("🔄 Обновить", callback_data=self.cb("bal"))), self.cb("m"))
-        self.bg(call, work)
 
     def supplier_buttons(self, kb: K, action: str, *extra: Any) -> None:
         sups = self.p.sup.list(enabled_only=True)
@@ -5127,23 +5069,6 @@ class TelegramUI:
         return self.scr_lot(lid)
 
     # ── мастер-лоты ──
-    def r_ml(self, call: CallbackQuery, *args: str) -> tuple:
-        kb = K()
-        for t in self.p.ml.templates():
-            cnt = self.p.db.scalar("SELECT COUNT(*) FROM lots WHERE template_id=?", (t["id"],), 0)
-            kb.row(B(f"🏷 {t['name']} ({cnt})", callback_data=self.cb("t", t["id"])))
-        kb.row(B("🪄 Шаблон из галереи", callback_data=self.cb("tg")), B("➕ С нуля", callback_data=self.cb("tn")))
-        kb.row(B("📋 Мои лоты", callback_data=self.cb("lots", 0)), B("🔤 Кодовые слова", callback_data=self.cb("cw")))
-        kb.row(B("🔁 Синхронизировать", callback_data=self.cb("sync")))
-        text = ("<b>🏷 Мастер-лоты</b>\nШаблон превращает услуги поставщика в готовые лоты FunPay.\n\n"
-                "<b>Быстрый старт (2 минуты):</b>\n"
-                "1. «🪄 Шаблон из галереи» → выберите платформу.\n"
-                "2. Найдите категорию FunPay по названию (например «instagram»).\n"
-                "3. «🚀 Запуск» → поставщик → «⭐ Авто-подбор» или категория.\n"
-                "4. Выберите наценку (например 25%) → предпросмотр → опубликовать.\n"
-                "Дальше цены, паузы и замены поставщиков плагин ведёт сам.")
-        return text, self.nav(kb, self.cb("m"))
-
     def r_tg(self, call: CallbackQuery, *args: str) -> tuple:
         kb = K()
         for key, preset in TEMPLATE_PRESETS.items():
@@ -5609,71 +5534,12 @@ class TelegramUI:
                 text += "\n" + "\n".join(f"• {esc(e)}" for e in rep["errors"][:15])
             if rep["unknown"]:
                 text += "\n⚠️ Неизвестные кодовые слова: " + ", ".join("{" + esc(u) + "}" for u in rep["unknown"])
-            return text, self.nav(K(), self.cb("t", run["tid"]))
+            return text, self.nav(K().row(B("📋 Мои лоты", callback_data=self.cb("lots", 0))), None)
 
-        self.bg(target, work, "⏳ Публикация…")
+        self.bg(target, work, "⏳ Выставляю лоты…")
         return None
 
     # ── лоты ──
-    def r_lots(self, call: CallbackQuery, page: str = "0") -> tuple:
-        lots = self.p.db.query("SELECT * FROM lots ORDER BY lost, id DESC")
-        kb = K()
-
-        def btn(l: dict) -> B:
-            mark = "❓" if l["lost"] else ("⏸" if l["auto_paused"] else ("✋" if l["manual_edit"] else
-                                                                          ("🟢" if l["enabled"] else "⚪")))
-            return B(f"{mark} #{l['id']} {(l['title'] or '')[:36]} | {l['price'] or '?'}₽",
-                     callback_data=self.cb("l", l["id"]))
-
-        self.paginate(kb, lots, int(page), btn, lambda pg: self.cb("lots", pg))
-        return (f"<b>📋 Лоты плагина</b>: {len(lots)}\n🟢 активен ⚪ выключен ⏸ автопауза ✋ ручные правки ❓ потерян",
-                self.nav(kb, self.cb("ml")))
-
-    def scr_lot(self, lid: int, notice: str = "") -> tuple[str, K]:
-        lot = self.p.db.one("SELECT * FROM lots WHERE id=?", (lid,))
-        if not lot:
-            return "Лот не найден.", self.nav(K(), self.cb("lots", 0))
-        try:
-            calc = self.p.price.calc_lot(lot)
-        except Exception as e:
-            calc = None
-            notice += f"\n⚠️ Расчёт: {esc(e)}"
-        cands = self.p.price.lot_candidates(lid, usable_only=False)
-        t = self.p.ml.template(lot["template_id"]) if lot["template_id"] else None
-        text = (f"{notice + chr(10) if notice else ''}<b>Лот #{lid}</b> — {esc((lot['title'] or '')[:150])}\n"
-                f"FP: {lot['fp_lot_id'] or '—'} (node {lot['node_id'] or '—'})"
-                f"{' https://funpay.com/lots/offer?id=' + str(lot['fp_lot_id']) if lot['fp_lot_id'] else ''}\n"
-                f"Шаблон: {esc(t['name']) if t else '—'} | пакет: {lot['pack_qty'] or '—'}\n"
-                f"Режим выбора: {self.p.cat.lot_mode(lot)}{' (лот)' if lot['mode'] else ''}\n"
-                f"Маржа лота: {lot['margin_override'] or '—'}% | ручная цена: {lot['manual_price'] or '—'}\n"
-                f"Текущая цена на FP: {lot['price'] or '—'} ₽\n"
-                f"Состояние: {'потерян ❓' if lot['lost'] else ('вкл' if lot['enabled'] else 'выкл')}"
-                f"{' | ✋ ручные правки' if lot['manual_edit'] else ''}"
-                f"{' | 🏷 умная скидка' if lot['discount_active'] else ''}"
-                f"{' | ⏸ автопауза: ' + ('нет баланса' if lot['auto_paused'] == 'balance' else 'нет услуги') if lot['auto_paused'] else ''}\n"
-                f"Кандидатов: {len(cands)}")
-        if calc:
-            text += (f"\nРасчётная цена: <b>{money(calc['price'])} ₽</b>, себестоимость {money(calc['cost'])} ₽, "
-                     f"прибыль {money(calc['profit'])} ₽")
-        kb = K()
-        kb.row(B("🧮 Расчёт", callback_data=self.cb("lx", lid)), B("🧩 Кандидаты", callback_data=self.cb("lc", lid)))
-        kb.row(B("⚙️ Режим выбора", callback_data=self.cb("lmode", lid)),
-               B("📈 Маржа лота", callback_data=self.cb("lm", lid)))
-        kb.row(B("💵 Ручная цена", callback_data=self.cb("lp", lid)),
-               B("📤 Обновить цену", callback_data=self.cb("lpush", lid)))
-        kb.row(B("⏸ Выключить" if lot["enabled"] else "▶️ Включить", callback_data=self.cb("le", lid)))
-        if lot["manual_price"]:
-            kb.row(B("↩️ Сбросить ручную цену", callback_data=self.cb("lpc", lid)))
-        if lot["manual_edit"]:
-            kb.row(B("✋ Снять «ручные правки»", callback_data=self.cb("lme", lid)))
-        if lot["lost"]:
-            kb.row(B("♻️ Восстановить", callback_data=self.cb("lr", lid)))
-        kb.row(B("🗑 Убрать из плагина", callback_data=self.cb("ldel", lid)))
-        return text, self.nav(kb, self.cb("lots", 0))
-
-    def r_l(self, call: CallbackQuery, lid: str) -> tuple:
-        return self.scr_lot(int(lid))
-
     def r_lx(self, call: CallbackQuery, lid: str) -> tuple:
         lot = self.p.db.one("SELECT * FROM lots WHERE id=?", (int(lid),))
         return self.p.price.explain(lot), self.nav(K(), self.cb("l", lid))
@@ -5797,13 +5663,6 @@ class TelegramUI:
         return self.r_lots(call, "0")
 
     # ── заказы ──
-    def r_o(self, call: CallbackQuery, *args: str) -> tuple:
-        kb = K()
-        kb.row(B("⏳ Активные", callback_data=self.cb("oa", 0)), B("⚠️ Проблемные", callback_data=self.cb("op", 0)))
-        kb.row(B("📜 Последние", callback_data=self.cb("ol", 0)), B("🔍 Поиск по номеру", callback_data=self.cb("os")))
-        kb.row(B("⛔ Чёрный список", callback_data=self.cb("bl", 0)))
-        return "<b>🧾 Заказы</b>", self.nav(kb, self.cb("m"))
-
     def order_list(self, rows: list[dict], page: int, act: str, title: str) -> tuple:
         kb = K()
         self.paginate(kb, rows, page,
@@ -5837,48 +5696,6 @@ class TelegramUI:
         if len(rows) == 1:
             return self.scr_order(rows[0]["id"])
         return self.order_list(rows, 0, "ol", f"🔍 «{esc(q)}»")
-
-    def scr_order(self, oid: int, notice: str = "") -> tuple[str, K]:
-        o = self.p.orders.get(oid)
-        if not o:
-            return "Заказ не найден.", self.nav(K(), self.cb("o"))
-        sup = self.p.sup.row(o["supplier_id"]) if o["supplier_id"] else None
-        svc = self.p.orders.primary_service(o)
-        profit = self.p.price.profit(D(o["price_paid"]), D(o["cost"])) if o["cost"] else None
-        text = (f"{notice + chr(10) if notice else ''}<b>{STATUS_EMOJI.get(o['status'], '')} Заказ "
-                f"#{esc(o['fp_order_id'])}</b> — {esc(o['status'])}{' ⚠️ ' + esc(o['error'] or '') if o['problem'] else ''}\n"
-                f"Покупатель: {esc(o['buyer'])}\nЛот: #{o['lot_id']}\n"
-                f"Услуга: {esc((svc or {}).get('name', '—'))[:80]}\n"
-                f"Поставщик: {esc(sup['name']) if sup else '—'} / {esc(o['service_id'] or '—')} / "
-                f"#{esc(o['supplier_order_id'] or '—')}\n"
-                f"Ссылка: {esc(o['link'] or '—')}\nКоличество: {o['quantity']}"
-                f"{' (+' + str(o['bonus_pct']) + '% промо)' if o['bonus_pct'] else ''} | остаток: "
-                f"{o['remain'] if o['remain'] is not None else '—'} | старт: {o['start_count'] or '—'}\n"
-                f"Оплачено: {money(o['price_paid'])} ₽ | себестоимость: {money(o['cost']) if o['cost'] else '—'} ₽ | "
-                f"прибыль: {money(profit) if profit is not None else '—'} ₽\n"
-                f"Возвращено: {money(o['refunded_amount'])} ₽"
-                f"{' | к возврату: ' + money(o['refund_due']) + ' ₽' if o['refund_due'] else ''}\n"
-                f"ETA: {esc(o['eta_text'] or '—')} | статус у поставщика: {esc(o['supplier_status'] or '—')}\n"
-                f"Создан: {fmt_ts(o['created_at'])} | обновлён: {fmt_ts(o['updated_at'])}\n\n<b>События:</b>")
-        for e in self.p.orders.events(oid)[-15:]:
-            text += f"\n{fmt_ts(e['ts'])} {esc(e['event'])} {esc((e['details'] or '')[:90])}"
-        kb = K()
-        kb.row(B("🔁 Повторить отправку", callback_data=self.cb("oact", oid, "retry")),
-               B("♻️ Refill", callback_data=self.cb("oact", oid, "refill")))
-        kb.row(B("✖️ Отмена у поставщика", callback_data=self.cb("oact", oid, "cancel")),
-               B("💸 Вернуть деньги", callback_data=self.cb("oref", oid)))
-        kb.row(B("✅ Закрыть вручную", callback_data=self.cb("oact", oid, "close")),
-               B("🔗 Запросить ссылку", callback_data=self.cb("oact", oid, "relink")))
-        if o["status"] == ORDER_PARTIAL or o["remain"]:
-            kb.row(B("🔁 Дозаказать остаток", callback_data=self.cb("oact", oid, "reorder")))
-        if o["status"] == ORDER_UNCERTAIN:
-            kb.row(B("✅ Заказ создан — ввести ID", callback_data=self.cb("ounc", oid)),
-                   B("🔁 Не создан — отправить", callback_data=self.cb("oact", oid, "resend")))
-        if o["problem"]:
-            kb.row(B("🧹 Снять «проблемный»", callback_data=self.cb("oact", oid, "unproblem")))
-        kb.row(B("⛔ Покупателя в ЧС", callback_data=self.cb("blo", oid)),
-               B("🔄 Обновить", callback_data=self.cb("od", oid)))
-        return text, self.nav(kb, self.cb("o"))
 
     def r_od(self, call: CallbackQuery, oid: str) -> tuple:
         return self.scr_order(int(oid))
@@ -5966,18 +5783,6 @@ class TelegramUI:
         self.bg(call, lambda: (self.p.raiser.raise_now(), self.nav(K(), self.cb("r"))), "⏳ Поднимаю…")
 
     # ── поставщики ──
-    def r_s(self, call: CallbackQuery, *args: str) -> tuple:
-        kb = K()
-        for s in self.p.sup.list():
-            mark = "🔑" if s["needs_key"] else ("🟢" if s["enabled"] else "🔴")
-            kb.row(B(f"{mark} {s['name']} (приоритет {s['priority']})", callback_data=self.cb("sp", s["id"])))
-        kb.row(B("➕ Подключить сайт", callback_data=self.cb("go1")))
-        kb.row(B("📥 Импорт профиля", callback_data=self.cb("simp")),
-               B(f"🎯 Выбор: {self.p.cfg.get('select_mode_default')}", callback_data=self.cb("smode")))
-        return ("<b>🔌 Сайты-поставщики</b>\n🟢 работает 🔴 выключен 🔑 нужен ключ — нажмите, чтобы ввести.\n\n"
-                "Подключите 2 сайта — если один не сможет выполнить заказ, плагин сам отправит его другому."), \
-            self.nav(kb, self.cb("m"))
-
     def r_smode(self, call: CallbackQuery, *args: str) -> tuple:
         kb = K()
         for m in SELECT_MODES:
@@ -6109,37 +5914,6 @@ class TelegramUI:
         return self.r_spe(call, str(sid))
 
     # карточка и редактор
-    def scr_sup(self, sid: int, notice: str = "") -> tuple[str, K]:
-        r = self.p.sup.row(sid)
-        if not r:
-            return "Поставщик не найден.", self.nav(K(), self.cb("s"))
-        prof = self.p.sup.profile(sid)
-        n = self.p.db.scalar("SELECT COUNT(*) FROM services WHERE supplier_id=?", (sid,), 0)
-        cached = self.p.sup._balances.get(sid)
-        text = (f"{notice + chr(10) if notice else ''}<b>🔌 {esc(r['name'])}</b> (#{sid})\n"
-                f"Пресет: {esc(r['preset'])}\nURL: <code>{esc(prof.get('base_url'))}</code>\n"
-                f"Валюта: {esc(prof.get('currency'))}, цена за {prof.get('rate_unit')}\n"
-                f"Состояние: {'🔑 нужен ключ' if r['needs_key'] else ('🟢 включён' if r['enabled'] else '🔴 выключен')}"
-                f" | приоритет {r['priority']}\nРежим выбора: {esc(r['select_mode'] or 'по умолчанию')}\n"
-                f"Услуг в кэше: {n} | привязанных лотов: {self.p.sup.bound_lots(sid)}\n"
-                f"Баланс (кэш): {money(cached[1]) + ' ' + esc(cached[2]) if cached else '—'}\n"
-                f"Последний успех: {fmt_ts(r['last_ok_at'])}\n"
-                f"Последняя ошибка: {esc(r['last_error'] or '—')}")
-        kb = K()
-        kb.row(B("💰 Баланс", callback_data=self.cb("spb", sid)), B("📶 Пинг", callback_data=self.cb("spg", sid)),
-               B("🧪 Тест", callback_data=self.cb("spt", sid)))
-        kb.row(B("✏️ Редактор профиля", callback_data=self.cb("spe", sid)),
-               B("🔑 Ключ", callback_data=self.cb("spf", sid, "api_key")))
-        kb.row(B("🔢 Приоритет", callback_data=self.cb("spprio", sid)),
-               B("⏸ Отключить" if r["enabled"] else "▶️ Включить", callback_data=self.cb("spx", sid)))
-        kb.row(B("📄 Дублировать", callback_data=self.cb("spd", sid)),
-               B("📤 Экспорт профиля", callback_data=self.cb("spexp", sid)))
-        kb.row(B("📂 Каталог", callback_data=self.cb("cs", sid, 0)), B("🗑 Удалить", callback_data=self.cb("spdel", sid)))
-        return text, self.nav(kb, self.cb("s"))
-
-    def r_sp(self, call: CallbackQuery, sid: str) -> tuple:
-        return self.scr_sup(int(sid))
-
     def r_spb(self, call: CallbackQuery, sid: str) -> None:
         def work() -> tuple:
             bal, cur = self.p.sup.balance(int(sid), max_age=0)
@@ -6457,34 +6231,6 @@ class TelegramUI:
         return "✅ База восстановлена.", self.nav(K(), self.cb("tfb"))
 
     # ── настройки ──
-    SIMPLE_TOGGLES = [
-        ("auto.refund_on_fail", "Автовозврат, если заказ не выполнить"),
-        ("auto.pause_lots_low_balance", "Пауза лотов, когда кончился баланс"),
-        ("raise.enabled", "Автоподнятие лотов"),
-        ("auto.refill_requests", "Автодокрутка по просьбе покупателя"),
-        ("auto.notify_new_orders", "Уведомлять о каждом заказе"),
-    ]
-
-    def r_st(self, call: CallbackQuery, *args: str) -> tuple:
-        cfg = self.p.cfg
-        kb = K()
-        kb.row(B(f"Режим: {'🧪 тестовый' if self.p.dry else '✅ боевой'}", callback_data=self.cb("go4")))
-        kb.row(B(f"Наценка: {cfg.get('margin_default')}%", callback_data=self.cb("go2")))
-        for i, (key, title) in enumerate(self.SIMPLE_TOGGLES):
-            kb.row(B(f"{'✅' if cfg.get(key) else '⬜'} {title}", callback_data=self.cb("sts", i)))
-        kb.row(B("✉️ Тексты сообщений покупателям", callback_data=self.cb("stmsg")))
-        kb.row(B("🔧 Все настройки (для опытных)", callback_data=self.cb("sta")))
-        return ("<b>⚙️ Настройки</b>\nГлавное — здесь. Нажмите на пункт, чтобы включить ✅ или выключить ⬜.\n"
-                "Остальное уже настроено по умолчанию."), self.nav(kb, self.cb("m"))
-
-    def r_sts(self, call: CallbackQuery, idx: str) -> tuple:
-        key = self.SIMPLE_TOGGLES[int(idx)][0]
-        value = not self.p.cfg.get(key)
-        self.p.cfg.set(key, value)
-        if key == "auto.pause_lots_low_balance":
-            self.p.cfg.set("auto.pause_lots_missing_service", value)
-        return self.r_st(call)
-
     def r_sta(self, call: CallbackQuery, *args: str) -> tuple:
         kb = K()
         groups = list(SETTINGS_GROUPS.items())
@@ -6592,6 +6338,459 @@ class TelegramUI:
     def r_dg(self, call: CallbackQuery, *args: str) -> None:
         kb = K().row(B("🔄 Обновить", callback_data=self.cb("dg")), B("🔁 Синхронизировать", callback_data=self.cb("sync")))
         self.bg(call, lambda: (self.p.rep.diagnostics(), self.nav(kb, self.cb("m"))), "⏳ Диагностика…")
+
+    # ═══ Упрощённый интерфейс ═══
+
+    def plugins_button(self, uid: Optional[int]) -> B:
+        offset = self.sess(uid).get("plugins_offset", "0") if uid else "0"
+        return B("◀️ К плагинам", callback_data=f"{CBT.PLUGINS_LIST}:{offset}")
+
+    def scr_main(self, uid: Optional[int] = None) -> tuple[str, K]:
+        p = self.p
+        steps = self.setup_steps()
+        done = sum(1 for s in steps if s[1])
+        active = p.db.scalar(f"SELECT COUNT(*) FROM orders WHERE status IN "
+                             f"({','.join('?' * len(ACTIVE_ORDER_STATUSES))})", ACTIVE_ORDER_STATUSES, 0)
+        problems = p.db.scalar("SELECT COUNT(*) FROM orders WHERE problem=1 AND status NOT IN ('CLOSED','REFUNDED')",
+                               (), 0)
+        lots = p.db.scalar("SELECT COUNT(*) FROM lots WHERE fp_lot_id IS NOT NULL AND lost=0", (), 0)
+        paused = p.db.scalar("SELECT COUNT(*) FROM lots WHERE auto_paused IS NOT NULL", (), 0)
+        lines = [f"<b>🤖 AutoSMMway</b> v{VERSION}"]
+        lines.append("🧪 Тестовый режим — ничего не отправляется по-настоящему" if p.dry else "✅ Работает")
+        if done < len(steps):
+            lines.append(f"⚙️ Настройка: {done}/{len(steps)} — нажмите «🚀 Начать»")
+        lines.append(f"Лотов: {lots} | заказов в работе: {active}")
+        if problems:
+            lines.append(f"⚠️ Требуют внимания: {problems} — «🧾 Заказы»")
+        if paused:
+            lines.append(f"⏸ Лотов на паузе: {paused} — пополните баланс сайта, включатся сами")
+        kb = K()
+        if done < len(steps):
+            kb.row(B("🚀 Начать (быстрая настройка)", callback_data=self.cb("go")))
+        kb.row(B("🏷 Лоты", callback_data=self.cb("ml")), B("🧾 Заказы", callback_data=self.cb("o")))
+        kb.row(B("🔌 Сайт", callback_data=self.cb("s")), B("📊 Статистика", callback_data=self.cb("bal")))
+        kb.row(B("⚙️ Настройки", callback_data=self.cb("st")))
+        kb.row(self.plugins_button(uid))
+        return "\n".join(lines), kb
+
+    # ── статистика ──
+    def r_bal(self, call: CallbackQuery, *args: str) -> None:
+        def work() -> tuple[str, K]:
+            lines = ["<b>📊 Статистика</b>", "", "<b>Баланс сайтов:</b>"]
+            for s in self.p.sup.list():
+                if s["needs_key"]:
+                    lines.append(f"🔑 {esc(s['name'])}: не подключён")
+                    continue
+                bal, cur = self.p.sup.balance(s["id"], max_age=0)
+                lines.append(f"{'🟢' if s['enabled'] else '🔴'} {esc(s['name'])}: "
+                             f"{money(bal) + ' ' + esc(cur) if bal is not None else 'нет ответа'}")
+            for days in (1, 7, 30):
+                lines.append("")
+                lines.append(self.p.rep.period(days, short=True))
+            return "\n".join(lines), self.nav(K().row(B("🔄 Обновить", callback_data=self.cb("bal"))), None)
+        self.bg(call, work, "⏳ Считаю…")
+
+    # ── настройки: только рычажки ──
+    SIMPLE_TOGGLES = [
+        ("auto.refund_on_fail", "Автовозврат денег, если заказ не выполнить"),
+        ("auto.pause_lots_low_balance", "Пауза лотов, когда кончился баланс"),
+        ("auto.auto_alternatives", "Запасной сайт, если основной не смог"),
+        ("auto.confirm_auto_start", "Запускать без «+», если покупатель молчит"),
+        ("auto.refill_requests", "Докрутка по просьбе покупателя"),
+        ("raise.enabled", "Автоподнятие лотов"),
+        ("loyalty.enabled", "Промокоды постоянным покупателям"),
+        ("auto.notify_new_orders", "Уведомление о каждом заказе"),
+    ]
+
+    def r_st(self, call: CallbackQuery, *args: str) -> tuple:
+        cfg = self.p.cfg
+        kb = K()
+        kb.row(B("✅ Боевой режим" if not self.p.dry else "🧪 Тестовый режим (нажмите — включить боевой)",
+                 callback_data=self.cb("stdry")))
+        kb.row(B(f"💰 Наценка: {cfg.get('margin_default'):g}%  (нажмите — изменить)", callback_data=self.cb("stmg")))
+        for i, (key, title) in enumerate(self.SIMPLE_TOGGLES):
+            kb.row(B(f"{'✅' if cfg.get(key) else '⬜'} {title}", callback_data=self.cb("sts", i)))
+        kb.row(B("✉️ Тексты сообщений покупателям", callback_data=self.cb("stmsg")))
+        return ("<b>⚙️ Настройки</b>\nНажмите на пункт: ✅ — включено, ⬜ — выключено.\n"
+                "Всё остальное плагин настраивает сам."), self.nav(kb, None)
+
+    def r_sts(self, call: CallbackQuery, idx: str) -> tuple:
+        key = self.SIMPLE_TOGGLES[int(idx)][0]
+        value = not self.p.cfg.get(key)
+        self.p.cfg.set(key, value)
+        if key == "auto.pause_lots_low_balance":
+            self.p.cfg.set("auto.pause_lots_missing_service", value)
+        if key == "raise.enabled" and value:
+            self.p.cfg.set("raise.categories", [])
+        return self.r_st(call)
+
+    def r_stdry(self, call: CallbackQuery, *args: str) -> tuple:
+        if self.p.dry:
+            kb = K().row(B("✅ Да, включить", callback_data=self.cb("go4s", 0)),
+                         B("Отмена", callback_data=self.cb("st")))
+            return ("Включить боевой режим? Лоты начнут выставляться на FunPay, а заказы — уходить на сайт. "
+                    "Перед этим пополните баланс сайта."), kb
+        self.p.cfg.set("dry_run", True)
+        return self.r_st(call)
+
+    def r_stmg(self, call: CallbackQuery, *args: str) -> tuple:
+        cur = float(self.p.cfg.get("margin_default"))
+        kb = K()
+        row = []
+        for m in (10, 15, 20, 25, 30, 40, 50, 70, 100):
+            row.append(B(("✅" if cur == m else "") + f"{m}%", callback_data=self.cb("stmgs", m)))
+            if len(row) == 3:
+                kb.row(*row)
+                row = []
+        return ("<b>💰 Наценка</b>\nСколько вы зарабатываете сверх цены сайта. Например, 25%: услуга за 100 ₽ "
+                "продаётся примерно за 125 ₽ (+ комиссии).\nЦены всех лотов пересчитаются автоматически."), \
+            self.nav(kb, self.cb("st"))
+
+    def r_stmgs(self, call: CallbackQuery, value: str) -> tuple:
+        self.p.cfg.set("margin_default", float(value))
+        self.p.db.meta_set("setup_margin", 1)
+        self.p.db.execute("UPDATE lots SET margin_override=NULL WHERE margin_override IS NOT NULL")
+        threading.Thread(target=self.p.pmon.run_once, daemon=True, name="asm-reprice").start()
+        self.toast(call, f"Наценка {value}% — цены обновляются")
+        return self.r_st(call)
+
+    # ── выставление лотов: пошагово, без кодовых слов ──
+    def r_ml(self, call: CallbackQuery, *args: str) -> tuple:
+        lots = self.p.db.scalar("SELECT COUNT(*) FROM lots WHERE lost=0", (), 0)
+        kb = K()
+        kb.row(B("➕ Выставить новые лоты", callback_data=self.cb("nl")))
+        kb.row(B(f"📋 Мои лоты ({lots})", callback_data=self.cb("lots", 0)))
+        return ("<b>🏷 Лоты</b>\n«Выставить новые лоты» — 4 простых шага кнопками. Тексты лотов, цены и "
+                "категорию плагин подберёт сам."), self.nav(kb, None)
+
+    def r_nl(self, call: CallbackQuery, *args: str) -> tuple:
+        if not any(not s["needs_key"] for s in self.p.sup.list(enabled_only=True)):
+            kb = K().row(B("🔌 Подключить сайт", callback_data=self.cb("go1")))
+            return "Сначала подключите сайт, с которого брать услуги.", self.nav(kb, self.cb("ml"))
+        self.sess(call.from_user.id)["nl"] = {}
+        kb = K()
+        for key, preset in TEMPLATE_PRESETS.items():
+            if key == "universal":
+                continue
+            kb.row(B(preset["title"], callback_data=self.cb("nlp", key)))
+        kb.row(B(TEMPLATE_PRESETS["universal"]["title"], callback_data=self.cb("nlp", "universal")))
+        return "<b>Шаг 1 из 4.</b> Что будете продавать?", self.nav(kb, self.cb("ml"))
+
+    def r_nlp(self, call: CallbackQuery, key: str) -> tuple:
+        preset = TEMPLATE_PRESETS[key]
+        nl = self.sess(call.from_user.id).setdefault("nl", {})
+        nl.update({"preset": key})
+        query = (preset.get("keywords") or [""])[0]
+        subs = self.node_search(query, preset.get("node_hints")) if query else []
+        kb = self.node_buttons(call.from_user.id, subs, "nln") if subs else K()
+        kb.row(B("🔍 Найти другую категорию", callback_data=self.cb("nlq")))
+        text = ("<b>Шаг 2 из 4.</b> В какую категорию FunPay выставить?\nПодходящие категории сверху — выберите "
+                "нужную." if subs else "<b>Шаг 2 из 4.</b> Нажмите «Найти» и напишите название категории FunPay, "
+                                       "например «instagram» или «tiktok».")
+        return text, self.nav(kb, self.cb("nl"))
+
+    def r_nlq(self, call: CallbackQuery, *args: str) -> None:
+        self.ask(call, call.from_user.id, "Напишите название категории FunPay (например: <code>instagram</code>, "
+                                          "<code>тикток</code>, <code>telegram</code>):", "nlq", {}, self.cb("nl"))
+
+    def i_nlq(self, target: tuple, uid: int, text: str, data: dict) -> tuple:
+        nums = re.findall(r"^\d+$", text.strip())
+        if nums:
+            sub = self.c.account.get_subcategory(SubCategoryTypes.COMMON, int(nums[0]))
+            subs = [sub] if sub else []
+        else:
+            subs = self.node_search(text)
+        if not subs:
+            kb = K().row(B("🔍 Искать ещё раз", callback_data=self.cb("nlq")))
+            return f"По «{esc(text)}» ничего не нашлось.", self.nav(kb, self.cb("nl"))
+        kb = self.node_buttons(uid, subs, "nln")
+        kb.row(B("🔍 Искать ещё раз", callback_data=self.cb("nlq")))
+        return "<b>Шаг 2 из 4.</b> Выберите категорию FunPay:", self.nav(kb, self.cb("nl"))
+
+    def _nl_template(self, preset_key: str, node: int) -> int:
+        preset = TEMPLATE_PRESETS[preset_key]
+        name = f"{preset['name']} [{node}]"
+        t = self.p.db.one("SELECT id FROM templates WHERE name=?", (name,))
+        if t:
+            return t["id"]
+        data = {k: preset[k] for k in MasterLot.TEMPLATE_FIELDS if k in preset}
+        data.update({"name": name, "category_node": node})
+        return self.p.ml.save_template(data)
+
+    def r_nln(self, call: CallbackQuery, idx: str) -> tuple:
+        uid = call.from_user.id
+        res = self.sess(uid).get("node_results") or []
+        nl = self.sess(uid).get("nl") or {}
+        if int(idx) >= len(res) or not nl.get("preset"):
+            return self.r_nl(call)
+        node_id, name = res[int(idx)]
+        nl.update({"node": int(node_id), "node_name": name, "tid": self._nl_template(nl["preset"], int(node_id))})
+        sups = [s for s in self.p.sup.list(enabled_only=True) if not s["needs_key"]]
+        if len(sups) == 1:
+            return self.r_nls(call, str(sups[0]["id"]))
+        kb = K()
+        for s in sups:
+            kb.row(B(f"🔌 {s['name']}", callback_data=self.cb("nls", s["id"])))
+        return "С какого сайта брать услуги?", self.nav(kb, self.cb("nl"))
+
+    def r_nls(self, call: CallbackQuery, sid: str, page: str = "0") -> Optional[tuple]:
+        nl = self.sess(call.from_user.id).get("nl") or {}
+        nl["sid"] = int(sid)
+        if self.p.sup.catalog_age(int(sid)) is None:
+            def work() -> tuple:
+                self.p.sup.refresh_catalog(int(sid), force=True)
+                return self.r_nls(call, sid, page)
+            self.bg(call, work, "⏳ Загружаю услуги сайта…")
+            return None
+        cats = self.p.sup.categories(int(sid))
+        preset = TEMPLATE_PRESETS.get(nl.get("preset"), {})
+        keys = [norm_text(k) for k in preset.get("keywords") or []]
+        hints = [norm_text(h) for h in preset.get("node_hints") or []]
+
+        def score(name: str) -> int:
+            n = norm_text(name)
+            return (2 if any(k in n for k in keys) else 0) + (1 if any(h in n for h in hints) else 0)
+
+        items = sorted(enumerate(cats), key=lambda it: -score(it[1]))
+        if keys:
+            matched = [it for it in items if score(it[1]) > 0]
+            items = matched or items
+        kb = K()
+        self.paginate(kb, items, int(page),
+                      lambda it: B(("🎯 " if score(it[1]) >= 3 else "") + it[1][:58],
+                                   callback_data=self.cb("nlc", it[0])),
+                      lambda pg: self.cb("nls", sid, pg))
+        return ("<b>Шаг 3 из 4.</b> Выберите раздел услуг на сайте.\n🎯 — лучше всего подходит.\n"
+                f"Категория FunPay: {esc(nl.get('node_name', ''))}"), self.nav(kb, self.cb("nl"))
+
+    def r_nlc(self, call: CallbackQuery, idx: str) -> tuple:
+        nl = self.sess(call.from_user.id).get("nl") or {}
+        cats = self.p.sup.categories(nl["sid"])
+        if int(idx) >= len(cats):
+            return self.r_nl(call)
+        nl["cat"] = int(idx)
+        recs = self.p.ml.recommend(nl["sid"], cats[int(idx)], nl["tid"], n=3)
+        nl["sel"] = [r["service_id"] for r in recs]
+        nl["why"] = {r["service_id"]: r["why"] for r in recs}
+        return self.scr_nl_services(call.from_user.id, 0)
+
+    def scr_nl_services(self, uid: int, page: int) -> tuple:
+        nl = self.sess(uid).get("nl") or {}
+        cats = self.p.sup.categories(nl["sid"])
+        cat = cats[nl["cat"]]
+        t = self.p.ml.template(nl["tid"]) or {}
+        unit = MasterLot.packs(t)[0] or self.p.ml.unit_for(t, 0)
+        items = [s for s in self.p.sup.services(nl["sid"], category=cat, include_disabled=False)
+                 if int(s["min"] or 1) <= unit <= int(s["max"] or 10 ** 9)]
+        sel = nl.setdefault("sel", [])
+        items.sort(key=lambda s: (s["service_id"] not in sel, D(s["rate"])))
+        kb = K()
+
+        def btn(s: dict) -> B:
+            try:
+                price = money(self.p.price.calc_service(nl["sid"], s, unit)["price"])
+            except Exception:
+                price = "?"
+            mark = "✅" if s["service_id"] in sel else "⬜"
+            return B(f"{mark} {price}₽ | {s['name'][:40]}", callback_data=self.cb("nlt", s["service_id"], page))
+
+        self.paginate(kb, items, page, btn, lambda pg: self.cb("nlpg", pg))
+        kb.row(B(f"➡️ Далее ({len(sel)} выбрано)", callback_data=self.cb("nlmg")))
+        why = "\n".join(f"⭐ {esc(v)}" for k, v in (nl.get("why") or {}).items() if k in sel)
+        return ("<b>Шаг 3 из 4.</b> Какие услуги выставить?\nЛучшие уже отмечены ✅ — можно оставить как есть. "
+                f"Цена указана за {unit} шт. для покупателя.\n" + (f"\n{why}" if why else "")), \
+            self.nav(kb, self.cb("nls", nl["sid"], 0))
+
+    def r_nlpg(self, call: CallbackQuery, page: str) -> tuple:
+        return self.scr_nl_services(call.from_user.id, int(page))
+
+    def r_nlt(self, call: CallbackQuery, svc: str, page: str) -> tuple:
+        nl = self.sess(call.from_user.id).get("nl") or {}
+        sel = nl.setdefault("sel", [])
+        if svc in sel:
+            sel.remove(svc)
+        else:
+            sel.append(svc)
+        return self.scr_nl_services(call.from_user.id, int(page))
+
+    def r_nlmg(self, call: CallbackQuery, *args: str) -> tuple:
+        nl = self.sess(call.from_user.id).get("nl") or {}
+        if not nl.get("sel"):
+            self.toast(call, "Отметьте хотя бы одну услугу", True)
+            return self.scr_nl_services(call.from_user.id, 0)
+        cur = nl.get("margin", self.p.cfg.get("margin_default"))
+        kb = K()
+        row = []
+        for m in (15, 20, 25, 30, 40, 50):
+            row.append(B(("✅" if float(cur) == m else "") + f"{m}%", callback_data=self.cb("nlms", m)))
+            if len(row) == 3:
+                kb.row(*row)
+                row = []
+        return ("<b>Шаг 4 из 4.</b> Какую наценку поставить?\n25% — услуга за 100 ₽ продаётся примерно за 125 ₽. "
+                "Новичкам подходит 25-30%."), self.nav(kb, self.cb("nlpg", 0))
+
+    def r_nlms(self, call: CallbackQuery, value: str) -> tuple:
+        nl = self.sess(call.from_user.id).get("nl") or {}
+        nl["margin"] = float(value)
+        services = [s for s in (self.p.sup.service(nl["sid"], x) for x in nl["sel"]) if s]
+        text = self.p.ml.preview(nl["tid"], nl["sid"], services, n=2, margin=D(value))
+        text = re.sub(r"\n⚠️ Неизвестные кодовые слова:[^\n]*", "", text)
+        kb = K().row(B(f"🚀 Выставить ({len(services)})", callback_data=self.cb("nlgo")))
+        kb.row(B("✏️ Изменить выбор", callback_data=self.cb("nlpg", 0)))
+        return "<b>Проверьте и выставляйте</b>\n" + text, self.nav(kb, self.cb("nlmg"))
+
+    def r_nlgo(self, call: CallbackQuery, *args: str) -> None:
+        nl = self.sess(call.from_user.id).pop("nl", None)
+        if not nl:
+            return None
+        self.sess(call.from_user.id)["run"] = {"tid": nl["tid"], "sid": nl["sid"], "mode": "sel", "arg": nl["sel"],
+                                               "services": list(nl["sel"]), "margin": str(D(nl["margin"]))}
+        return self.r_trgoy(call)
+
+    # ── мои лоты ──
+    def r_lots(self, call: CallbackQuery, page: str = "0") -> tuple:
+        lots = self.p.db.query("SELECT * FROM lots WHERE lost=0 ORDER BY id DESC")
+        kb = K()
+
+        def btn(l: dict) -> B:
+            mark = "⏸" if l["auto_paused"] or not l["enabled"] else "🟢"
+            return B(f"{mark} {l['price'] or '?'}₽ | {(l['title'] or '')[:40]}", callback_data=self.cb("l", l["id"]))
+
+        self.paginate(kb, lots, int(page), btn, lambda pg: self.cb("lots", pg))
+        kb.row(B("➕ Выставить ещё", callback_data=self.cb("nl")))
+        return f"<b>📋 Мои лоты</b>: {len(lots)}\n🟢 продаётся ⏸ на паузе", self.nav(kb, self.cb("ml"))
+
+    def scr_lot(self, lid: int, notice: str = "") -> tuple[str, K]:
+        lot = self.p.db.one("SELECT * FROM lots WHERE id=?", (lid,))
+        if not lot:
+            return "Лот не найден.", self.nav(K(), self.cb("lots", 0))
+        try:
+            calc = self.p.price.calc_lot(lot)
+        except Exception:
+            calc = None
+        if lot["auto_paused"]:
+            state = "⏸ на паузе: " + ("нет баланса на сайте" if lot["auto_paused"] == "balance" else
+                                      "услуга недоступна на сайте") + " (включится сам)"
+        else:
+            state = "🟢 продаётся" if lot["enabled"] else "⏸ выключен вами"
+        margin = lot["margin_override"] or self.p.cfg.get("margin_default")
+        text = (f"{notice + chr(10) if notice else ''}<b>{esc((lot['title'] or '')[:150])}</b>\n"
+                f"Состояние: {state}\nЦена: <b>{lot['price'] or '—'} ₽</b> | наценка {margin}%")
+        if calc:
+            text += f"\nС каждой продажи вы получаете ≈ <b>{money(calc['profit'])} ₽</b>"
+        if lot["fp_lot_id"]:
+            text += f"\nhttps://funpay.com/lots/offer?id={lot['fp_lot_id']}"
+        kb = K()
+        kb.row(B("⏸ Выключить" if lot["enabled"] else "▶️ Включить", callback_data=self.cb("le", lid)),
+               B("💰 Наценка", callback_data=self.cb("lmg", lid)))
+        kb.row(B("🧮 Как посчитана цена", callback_data=self.cb("lx", lid)),
+               B("🗑 Удалить", callback_data=self.cb("ldel", lid)))
+        return text, self.nav(kb, self.cb("lots", 0))
+
+    def r_l(self, call: CallbackQuery, lid: str) -> tuple:
+        return self.scr_lot(int(lid))
+
+    def r_lmg(self, call: CallbackQuery, lid: str) -> tuple:
+        kb = K()
+        row = []
+        for m in (10, 15, 20, 25, 30, 40, 50, 70, 100):
+            row.append(B(f"{m}%", callback_data=self.cb("lmgs", lid, m)))
+            if len(row) == 3:
+                kb.row(*row)
+                row = []
+        kb.row(B("Как в настройках", callback_data=self.cb("lmgs", lid, "-")))
+        return "Наценка для этого лота:", self.nav(kb, self.cb("l", lid))
+
+    def r_lmgs(self, call: CallbackQuery, lid: str, value: str) -> None:
+        self.p.db.execute("UPDATE lots SET margin_override=? WHERE id=?", (None if value == "-" else value, int(lid)))
+
+        def work() -> tuple:
+            lot = self.p.db.one("SELECT * FROM lots WHERE id=?", (int(lid),))
+            calc = self.p.price.calc_lot(lot)
+            if calc and lot["fp_lot_id"] and not lot["manual_price"]:
+                self.p.pmon.push_price(lot, calc["price"], "margin")
+            return self.scr_lot(int(lid), "✅ Наценка сохранена, цена обновлена.")
+        self.bg(call, work)
+
+    # ── сайт-поставщик ──
+    def r_s(self, call: CallbackQuery, *args: str) -> tuple:
+        kb = K()
+        for s in self.p.sup.list():
+            mark = "🔑" if s["needs_key"] else ("🟢" if s["enabled"] else "🔴")
+            kb.row(B(f"{mark} {s['name']}", callback_data=self.cb("sp", s["id"])))
+        kb.row(B("➕ Подключить сайт", callback_data=self.cb("go1")))
+        return ("<b>🔌 Сайты</b>\n🟢 работает 🔴 выключен 🔑 нужен ключ\n\n"
+                "💡 Можно подключить два сайта: если один не выполнит заказ, плагин сам отправит его на другой."), \
+            self.nav(kb, None)
+
+    def scr_sup(self, sid: int, notice: str = "") -> tuple[str, K]:
+        r = self.p.sup.row(sid)
+        if not r:
+            return "Сайт не найден.", self.nav(K(), self.cb("s"))
+        cached = self.p.sup._balances.get(sid)
+        state = "🔑 нужен ключ" if r["needs_key"] else ("🟢 работает" if r["enabled"] else "🔴 выключен")
+        text = (f"{notice + chr(10) if notice else ''}<b>🔌 {esc(r['name'])}</b>\nСостояние: {state}\n"
+                f"Баланс: {money(cached[1]) + ' ' + esc(cached[2]) if cached else 'нажмите «Баланс»'}\n"
+                f"Лотов с этого сайта: {self.p.sup.bound_lots(sid)}")
+        if r["last_error"]:
+            text += f"\n⚠️ Последняя ошибка: {esc(r['last_error'][:120])}"
+        kb = K()
+        kb.row(B("💰 Баланс", callback_data=self.cb("spb", sid)), B("🔑 Сменить ключ", callback_data=self.cb("spf", sid,
+                                                                                                         "api_key")))
+        kb.row(B("⏸ Выключить" if r["enabled"] else "▶️ Включить", callback_data=self.cb("spx", sid)),
+               B("🗑 Удалить", callback_data=self.cb("spdel", sid)))
+        if r["preset"] == "rest_custom":
+            kb.row(B("🛠 Настройка API", callback_data=self.cb("spe", sid)))
+        return text, self.nav(kb, self.cb("s"))
+
+    def r_sp(self, call: CallbackQuery, sid: str) -> tuple:
+        return self.scr_sup(int(sid))
+
+    # ── заказы ──
+    def r_o(self, call: CallbackQuery, *args: str) -> tuple:
+        problems = self.p.db.scalar("SELECT COUNT(*) FROM orders WHERE problem=1 AND status NOT IN "
+                                    "('CLOSED','REFUNDED')", (), 0)
+        kb = K()
+        if problems:
+            kb.row(B(f"⚠️ Требуют внимания ({problems})", callback_data=self.cb("op", 0)))
+        kb.row(B("⏳ В работе", callback_data=self.cb("oa", 0)), B("📜 Все", callback_data=self.cb("ol", 0)))
+        kb.row(B("🔍 Найти по номеру", callback_data=self.cb("os")))
+        return ("<b>🧾 Заказы</b>\nПлагин сам принимает заказы, отправляет их на сайт и возвращает деньги, если "
+                "что-то пошло не так. Сюда заглядывайте, только если есть «⚠️ Требуют внимания»."), \
+            self.nav(kb, None)
+
+    def scr_order(self, oid: int, notice: str = "") -> tuple[str, K]:
+        o = self.p.orders.get(oid)
+        if not o:
+            return "Заказ не найден.", self.nav(K(), self.cb("o"))
+        svc = self.p.orders.primary_service(o)
+        profit = self.p.price.profit(D(o["price_paid"]), D(o["cost"])) if o["cost"] and \
+            o["status"] != ORDER_REFUNDED else None
+        status = self.p.msg.status_text(o)
+        text = (f"{notice + chr(10) if notice else ''}<b>{STATUS_EMOJI.get(o['status'], '')} Заказ "
+                f"#{esc(o['fp_order_id'])}</b> — {esc(status)}\n"
+                f"Покупатель: {esc(o['buyer'])}\nУслуга: {esc((svc or {}).get('name', '—'))[:80]}\n"
+                f"Ссылка: {esc(o['link'] or '—')}\nКоличество: {o['quantity']}"
+                f"{' | осталось ' + str(o['remain']) if o['remain'] else ''}\n"
+                f"Оплачено: {money(o['price_paid'])} ₽" + (f" | прибыль {money(profit)} ₽" if profit is not None
+                                                           else ""))
+        if o["problem"] and o["error"]:
+            reason = REFUND_REASONS.get(o["error"], ("", o["error"]))[1]
+            text += f"\n⚠️ {esc(reason)}"
+        if o["status"] == ORDER_UNCERTAIN:
+            text += ("\n\n❓ Связь с сайтом оборвалась при отправке — заказ мог создаться. Проверьте в кабинете "
+                     "сайта, есть ли заказ на эту ссылку.")
+        kb = K()
+        if o["status"] == ORDER_UNCERTAIN:
+            kb.row(B("✅ Есть на сайте — ввести номер", callback_data=self.cb("ounc", oid)))
+            kb.row(B("🔁 Нет на сайте — отправить", callback_data=self.cb("oact", oid, "resend")))
+        elif o["status"] in (ORDER_FAILED, ORDER_PARTIAL) or (o["problem"] and o["status"] != ORDER_IN_PROGRESS):
+            kb.row(B("🔁 Отправить ещё раз", callback_data=self.cb("oact", oid, "retry")))
+        if o["status"] not in (ORDER_REFUNDED, ORDER_CLOSED):
+            kb.row(B("💸 Вернуть деньги", callback_data=self.cb("oref", oid)),
+                   B("✅ Закрыть", callback_data=self.cb("oact", oid, "close")))
+        kb.row(B("🔄 Обновить", callback_data=self.cb("od", oid)))
+        return text, self.nav(kb, self.cb("o"))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
